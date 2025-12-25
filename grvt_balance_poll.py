@@ -4,8 +4,9 @@ import signal
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Dict
 
 import requests
 
@@ -18,6 +19,8 @@ from pysdk.grvt_raw_types import EmptyRequest, SpotBalance
 
 POLL_INTERVAL_SECONDS = 60
 ALERT_URL_TEMPLATE = "https://api.day.app/{device_key}/{title}?call=1&level=critical&sound=birdsong"
+# 北京时间 UTC+8
+BEIJING_TZ = timezone(timedelta(hours=8))
 
 
 @dataclass
@@ -129,6 +132,52 @@ def send_alert(account_name: str, total_equity: float, threshold: float) -> None
         logging.error("[%s] Error sending alert: %s", account_name, exc)
 
 
+def send_daily_summary(account_balances: Dict[str, float]) -> None:
+    """发送每日余额正常汇总消息。"""
+    try:
+        device_key = os.getenv("GRVT_ALERT_DEVICE_KEY", "JTUG68ZG3ZAP2ALeKRWc6U")
+        alert_url_template = os.getenv("GRVT_ALERT_URL", ALERT_URL_TEMPLATE)
+        
+        # 构建消息内容：账户余额正常，分别是：[账户1] 余额, [账户2] 余额...
+        balance_list = ", ".join([f"[{name}] {balance:.2f}" for name, balance in account_balances.items()])
+        title = f"账户余额正常，分别是：{balance_list}"
+        
+        # 将标题编码
+        encoded_title = requests.utils.quote(title)
+        
+        # 替换 URL 模板中的占位符
+        url = alert_url_template.format(device_key=device_key, title=encoded_title)
+        
+        response = requests.get(url, timeout=5)
+        if response.status_code == 200:
+            logging.info("Daily summary sent: %d account(s) with normal balance", len(account_balances))
+        else:
+            logging.error("Failed to send daily summary: HTTP %d", response.status_code)
+    except Exception as exc:
+        logging.error("Error sending daily summary: %s", exc)
+
+
+def should_send_daily_summary() -> bool:
+    """检查是否到了发送每日汇总的时间（北京时间）。"""
+    try:
+        # 获取配置的发送时间，格式：HH:MM，默认 16:30
+        send_time_str = os.getenv("GRVT_DAILY_SUMMARY_TIME", "16:30")
+        hour, minute = map(int, send_time_str.split(":"))
+        
+        # 获取当前北京时间
+        beijing_now = datetime.now(BEIJING_TZ)
+        current_hour = beijing_now.hour
+        current_minute = beijing_now.minute
+        
+        # 检查是否到了发送时间（允许在指定时间的1分钟内发送）
+        if current_hour == hour and current_minute >= minute and current_minute < minute + 1:
+            return True
+        return False
+    except Exception as exc:
+        logging.warning("Error checking daily summary time: %s", exc)
+        return False
+
+
 def log_balances(account_name: str, total_equity: str, balances: Iterable[SpotBalance], threshold: float | None = None) -> None:
     """显示账户总权益信息，并检查是否需要发送提醒。"""
     logging.info("[%s] Total Equity: %s", account_name, total_equity)
@@ -186,19 +235,49 @@ def main() -> None:
     logging.info("GRVT balance polling started for %d account(s) (interval %ss)", 
                 len(clients), POLL_INTERVAL_SECONDS)
     
+    last_summary_date = None  # 记录上次发送每日汇总的日期
+    
     while not stop_flag["stop"]:
+        account_balances = {}  # 存储所有账户的余额信息
+        all_accounts_normal = True  # 标记是否所有账户余额都正常
+        
         for account_name, account_data in clients.items():
             try:
                 response = account_data["client"].aggregated_account_summary_v1(EmptyRequest())
                 if isinstance(response, GrvtError):
                     logging.error("[%s] API error fetching balance: code=%s status=%s", 
                                 account_name, response.code, response.status)
+                    all_accounts_normal = False
                 else:
                     account_config = account_data["config"]
-                    log_balances(account_name, response.result.total_equity, 
+                    total_equity_str = response.result.total_equity
+                    log_balances(account_name, total_equity_str, 
                                response.result.spot_balances, account_config.threshold)
+                    
+                    # 记录余额信息
+                    try:
+                        total_equity_float = float(total_equity_str)
+                        account_balances[account_name] = total_equity_float
+                        
+                        # 检查是否低于限定值
+                        if account_config.threshold is not None and total_equity_float < account_config.threshold:
+                            all_accounts_normal = False
+                    except ValueError:
+                        all_accounts_normal = False
             except Exception as exc:
                 logging.error("[%s] Error fetching balance: %s", account_name, exc)
+                all_accounts_normal = False
+        
+        # 检查是否需要发送每日汇总（余额正常时）
+        if all_accounts_normal and account_balances:
+            beijing_now = datetime.now(BEIJING_TZ)
+            current_date = beijing_now.date()
+            
+            # 如果到了发送时间且今天还没发送过
+            if should_send_daily_summary() and last_summary_date != current_date:
+                send_daily_summary(account_balances)
+                last_summary_date = current_date
+        
         time.sleep(POLL_INTERVAL_SECONDS)
 
     logging.info("GRVT balance polling stopped")
