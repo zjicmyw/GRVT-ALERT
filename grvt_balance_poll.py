@@ -110,7 +110,10 @@ def send_alert(account_name: str, total_equity: float, threshold: float) -> None
     """发送余额低于限定值的提醒。"""
     try:
         # 从环境变量读取设备码和 URL 模板
-        device_key = os.getenv("GRVT_ALERT_DEVICE_KEY", "JTUG68ZG3ZAP2ALeKRWc6U")
+        device_key = os.getenv("GRVT_ALERT_DEVICE_KEY")
+        if not device_key:
+            logging.error("[%s] GRVT_ALERT_DEVICE_KEY not configured, cannot send alert", account_name)
+            return
         alert_url_template = os.getenv("GRVT_ALERT_URL", ALERT_URL_TEMPLATE)
         
         # 构建消息内容：GRVT账户余额低于多少
@@ -135,7 +138,10 @@ def send_alert(account_name: str, total_equity: float, threshold: float) -> None
 def send_daily_summary(account_balances: Dict[str, float]) -> None:
     """发送每日余额正常汇总消息。"""
     try:
-        device_key = os.getenv("GRVT_ALERT_DEVICE_KEY", "JTUG68ZG3ZAP2ALeKRWc6U")
+        device_key = os.getenv("GRVT_ALERT_DEVICE_KEY")
+        if not device_key:
+            logging.error("GRVT_ALERT_DEVICE_KEY not configured, cannot send daily summary")
+            return
         alert_url_template = os.getenv("GRVT_ALERT_URL", ALERT_URL_TEMPLATE)
         
         # 构建消息内容：账户余额正常，分别是：[账户1] 余额, [账户2] 余额...
@@ -147,6 +153,12 @@ def send_daily_summary(account_balances: Dict[str, float]) -> None:
         
         # 替换 URL 模板中的占位符
         url = alert_url_template.format(device_key=device_key, title=encoded_title)
+        
+        # 为每日汇总添加特殊参数：isArchive=0（不保存）和 volume=0（静音）
+        if "?" in url:
+            url += "&isArchive=0&volume=0"
+        else:
+            url += "?isArchive=0&volume=0"
         
         response = requests.get(url, timeout=5)
         if response.status_code == 200:
