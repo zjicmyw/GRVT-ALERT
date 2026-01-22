@@ -1,5 +1,6 @@
 import json
 import logging
+import logging.handlers
 import os
 import random
 import re
@@ -2020,11 +2021,41 @@ def main() -> None:
     }
     log_level_value = log_level_map.get(log_level, logging.INFO)
     
-    # 配置日志格式，包含更多调试信息
-    logging.basicConfig(
-        level=log_level_value,
-        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    # 创建日志目录
+    script_dir = Path(__file__).parent
+    logs_dir = script_dir / "logs"
+    logs_dir.mkdir(exist_ok=True)
+    
+    # 日志格式
+    log_format = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
+    date_format = "%Y-%m-%d %H:%M:%S"
+    
+    # 配置根 logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(log_level_value)
+    
+    # 清除已有的处理器（避免重复）
+    root_logger.handlers.clear()
+    
+    # 文件日志处理器（带轮转，每天一个文件，保留30天）
+    log_file = logs_dir / "grvt_balance_poll.log"
+    file_handler = logging.handlers.TimedRotatingFileHandler(
+        filename=str(log_file),
+        when='midnight',
+        interval=1,
+        backupCount=30,
+        encoding='utf-8'
     )
+    file_handler.setLevel(log_level_value)
+    file_handler.setFormatter(logging.Formatter(log_format, date_format))
+    root_logger.addHandler(file_handler)
+    
+    # 控制台日志处理器（仅在有终端时添加）
+    if sys.stdout.isatty():
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(log_level_value)
+        console_handler.setFormatter(logging.Formatter(log_format, date_format))
+        root_logger.addHandler(console_handler)
     
     # 设置 GRVT SDK 的日志级别（默认完全静默，减少冗余日志）
     # SDK 使用 'grvt_raw_' 前缀的 logger

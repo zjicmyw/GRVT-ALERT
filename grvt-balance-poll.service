@@ -1,0 +1,30 @@
+[Unit]
+Description=GRVT Balance Polling Service
+Documentation=https://github.com/your-repo/grvt-balance-poll
+After=network.target
+
+[Service]
+Type=simple
+User=grvt
+Group=grvt
+WorkingDirectory=/opt/grvt-balance-poll
+Environment="PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+ExecStart=/usr/bin/python3 /opt/grvt-balance-poll/grvt_balance_poll.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=grvt-balance-poll
+
+# 安全设置
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/grvt-balance-poll/logs
+
+# 资源限制
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
