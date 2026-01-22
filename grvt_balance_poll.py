@@ -60,9 +60,6 @@ def build_client(account_config: AccountConfig) -> GrvtRawSync:
     Args:
         account_config: 账户配置
     """
-    logging.debug("[%s] Building client: account_type=%s, account_id=%s, env=%s", 
-                 account_config.name, account_config.account_type, account_config.account_id, account_config.env)
-    
     # 处理私钥：空字符串转为 None，但确保 private_key 不为 None（SDK 可能需要）
     if not account_config.private_key or account_config.private_key == "":
         # 如果私钥未配置，尝试使用一个默认值或抛出错误
@@ -71,28 +68,21 @@ def build_client(account_config: AccountConfig) -> GrvtRawSync:
                         f"Please configure GRVT_{account_config.account_type.upper()}_PRIVATE_KEY")
     
     private_key = account_config.private_key
-    logging.debug("[%s] Private key configured: length=%d, starts_with_0x=%s", 
-                 account_config.name, len(private_key), private_key.startswith('0x') if private_key else False)
     
     # 检查 API key
     if not account_config.api_key:
         raise ValueError(f"[{account_config.name}] API key is required")
-    logging.debug("[%s] API key configured: length=%d", account_config.name, len(account_config.api_key))
 
     env_raw = account_config.env.lower()
 
     try:
         env = GrvtEnv(env_raw)
-        logging.debug("[%s] Environment: %s", account_config.name, env.value)
     except ValueError as exc:
         raise ValueError(f"Unsupported GRVT_ENV '{env_raw}', expected one of {[e.value for e in GrvtEnv]}") from exc
 
     # 对于交易账户和资金账户，都使用 account_id 作为 trading_account_id
     # GRVT SDK 的 GrvtApiConfig 使用 trading_account_id 字段，但实际可以用于资金账户
     # 参考 grvt-transfer：确保所有必需参数都正确传递
-    logging.debug("[%s] Creating GrvtApiConfig: trading_account_id=%s", 
-                 account_config.name, account_config.account_id)
-    
     config = GrvtApiConfig(
         env=env,
         trading_account_id=account_config.account_id,
@@ -101,18 +91,13 @@ def build_client(account_config: AccountConfig) -> GrvtRawSync:
         logger=logging.getLogger(f"grvt_raw_{account_config.name}"),
     )
     
-    logging.debug("[%s] GrvtApiConfig created successfully", account_config.name)
-    
     # 创建客户端
     # 参考 grvt-transfer：直接创建客户端，认证会在第一次 API 调用时自动进行
-    logging.debug("[%s] Creating GrvtRawSync client...", account_config.name)
     client = GrvtRawSync(config)
-    logging.debug("[%s] GrvtRawSync client created successfully", account_config.name)
     
     # 尝试进行一次测试调用以验证认证是否成功
     # 如果认证失败，会在第一次调用时发现
     try:
-        logging.debug("[%s] Testing authentication with a simple API call...", account_config.name)
         if account_config.account_type == "trading":
             # 对于交易账户，尝试获取账户摘要
             test_response = client.aggregated_account_summary_v1(EmptyRequest())
@@ -882,9 +867,6 @@ def check_and_balance_accounts_improved(
         target_balance = total_equity * (target_percent / 100)
         needed = target_balance - account1_equity
         
-        logging.info("[Auto-Balance] %s balance %.2f%% is below threshold %.2f%%, need to transfer %.2f from %s",
-                    account1_name, account1_percent, threshold_percent, needed, account2_name)
-        
         # 使用账户2的可用余额和维持保证金计算安全转账金额
         transfer_amount = calculate_safe_transfer_amount(
             account2_equity, account2_available, account2_mm, needed
@@ -899,6 +881,8 @@ def check_and_balance_accounts_improved(
             "from_account": account2_name,
             "to_account": account1_name,
             "amount": transfer_amount,
+            "account1_percent": account1_percent,
+            "account2_percent": account2_percent,
             "reason": f"Account {account1_name} balance {account1_percent:.2f}% below threshold {threshold_percent}% (needed: {needed:.2f}, safe: {transfer_amount:.2f})"
         }
         
@@ -906,9 +890,6 @@ def check_and_balance_accounts_improved(
         # 账户2低于阈值，需要从账户1转账到账户2
         target_balance = total_equity * (target_percent / 100)
         needed = target_balance - account2_equity
-        
-        logging.info("[Auto-Balance] %s balance %.2f%% is below threshold %.2f%%, need to transfer %.2f from %s",
-                    account2_name, account2_percent, threshold_percent, needed, account1_name)
         
         # 使用账户1的可用余额和维持保证金计算安全转账金额
         transfer_amount = calculate_safe_transfer_amount(
@@ -924,6 +905,8 @@ def check_and_balance_accounts_improved(
             "from_account": account1_name,
             "to_account": account2_name,
             "amount": transfer_amount,
+            "account1_percent": account1_percent,
+            "account2_percent": account2_percent,
             "reason": f"Account {account2_name} balance {account2_percent:.2f}% below threshold {threshold_percent}% (needed: {needed:.2f}, safe: {transfer_amount:.2f})"
         }
     else:
@@ -1331,8 +1314,7 @@ def transfer_trading_to_funding(
             return False, tx_info
         
         tx_id = tx_info.get("tx_id")
-        logging.info("[%s] Transferred %.2f %s from trading to funding account (tx_id: %s)", 
-                    trading_config.name, amount, currency, tx_id or "N/A")
+        # Success log removed - will be logged at TransferFlow level
         return True, tx_info
         
     except Exception as exc:
@@ -1470,8 +1452,7 @@ def transfer_funding_to_trading(
             return False, tx_info
         
         tx_id = tx_info.get("tx_id")
-        logging.info("[%s] Transferred %.2f %s from funding to trading account (tx_id: %s)", 
-                    funding_config.name, amount, currency, tx_id or "N/A")
+        # Success log removed - will be logged at TransferFlow level
         return True, tx_info
         
     except Exception as exc:
@@ -1564,12 +1545,9 @@ def transfer_between_trading_accounts_via_funding(
         from_funding_pre = get_funding_account_balance(from_funding_client, currency)
         to_funding_pre = get_funding_account_balance(to_funding_client, currency)
         
-        logging.info("[Transfer] Starting transfer via funding: %.2f %s from %s to %s",
-                    amount, currency, from_trading_config.name, to_trading_config.name)
-        
         # 步骤1: A-trading → A-funding（使用A-trading的API key）
-        logging.info("[Transfer] Step 1: %s trading → %s funding (using %s trading API key)", 
-                    from_trading_config.name, from_funding_config.name, from_trading_config.name)
+        logging.info("[Transfer] Step 1/3: %s → %s", 
+                    from_trading_config.name, from_funding_config.name)
         step1_success, step1_info = transfer_trading_to_funding(
             from_trading_config, from_main_account_id,
             from_trading_config.account_id,
@@ -1577,41 +1555,43 @@ def transfer_between_trading_accounts_via_funding(
         )
         
         if not step1_success:
-            logging.error("[Transfer] Step 1 failed: trading → funding")
+            logging.error("[Transfer] Step 1/3 failed: trading → funding")
             logging.error("[Transfer] ⚠️  这需要使用 %s 的 trading 账户 API key，需要 Internal Transfer 权限（从 Trading 到 Funding）", from_trading_config.name)
             logging.error("[Transfer] 出问题的 API key: %s (账户类型: %s, 账户ID: %s)", 
                         from_trading_config.api_key[:8] + "...", from_trading_config.account_type, from_trading_config.account_id)
             logging.error("[Transfer] 请在 GRVT 网页端（Settings > API Keys）检查并更新此 API key 的权限")
             
-            # 记录失败信息
-            transfer_log = {
-                "event_time": start_time,
-                "success": False,
-                "transfer_usdt": str(amount),
-                "step": 1,
-                "step_name": "trading_to_funding",
-                "from_trading": from_trading_config.name,
-                "to_trading": to_trading_config.name,
-                "error": step1_info.get("error", {}),
-                "tx_ids": {},
-                "balances_pre": {
-                    "from_trading": from_trading_pre,
-                    "to_trading": to_trading_pre,
-                    "from_funding": from_funding_pre,
-                    "to_funding": to_funding_pre
+            # 记录失败信息（仅在 DEBUG 模式下记录完整日志）
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                transfer_log = {
+                    "event_time": start_time,
+                    "success": False,
+                    "transfer_usdt": str(amount),
+                    "step": 1,
+                    "step_name": "trading_to_funding",
+                    "from_trading": from_trading_config.name,
+                    "to_trading": to_trading_config.name,
+                    "error": step1_info.get("error", {}),
+                    "tx_ids": {},
+                    "balances_pre": {
+                        "from_trading": from_trading_pre,
+                        "to_trading": to_trading_pre,
+                        "from_funding": from_funding_pre,
+                        "to_funding": to_funding_pre
+                    }
                 }
-            }
-            logging.info("[Transfer] Transfer log: %s", json.dumps(transfer_log, default=str))
+                logging.debug("[Transfer] Transfer log: %s", json.dumps(transfer_log, default=str))
             return False
         
         step1_tx_id = step1_info.get("tx_id")
-        logging.info("[Transfer] Step 1 completed (tx_id: %s)", step1_tx_id or "N/A")
+        logging.info("[Transfer] Step 1/3: %s → %s (tx_id: %s)", 
+                    from_trading_config.name, from_funding_config.name, step1_tx_id or "N/A")
         
         # 等待一下，确保步骤1的转账完成（参考测试脚本）
         time.sleep(3)
         
         # 步骤2: A-funding → B-funding (外部转账，使用地址)
-        logging.info("[Transfer] Step 2: %s funding → %s funding (external, using address)", 
+        logging.info("[Transfer] Step 2/3: %s → %s", 
                     from_funding_config.name, to_funding_config.name)
         
         # 获取目标资金账户地址
@@ -1627,23 +1607,20 @@ def transfer_between_trading_accounts_via_funding(
             if not rollback_success:
                 logging.error("[Transfer] Rollback failed! Funds may be stuck in %s funding account", from_funding_config.name)
             
-            transfer_log = {
-                "event_time": start_time,
-                "success": False,
-                "transfer_usdt": str(amount),
-                "step": 2,
-                "step_name": "funding_to_funding",
-                "error": "Target funding address not configured",
-                "rollback_attempted": True,
-                "rollback_success": rollback_success,
-                "tx_ids": {"step1": step1_tx_id}
-            }
-            logging.info("[Transfer] Transfer log: %s", json.dumps(transfer_log, default=str))
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                transfer_log = {
+                    "event_time": start_time,
+                    "success": False,
+                    "transfer_usdt": str(amount),
+                    "step": 2,
+                    "step_name": "funding_to_funding",
+                    "error": "Target funding address not configured",
+                    "rollback_attempted": True,
+                    "rollback_success": rollback_success,
+                    "tx_ids": {"step1": step1_tx_id}
+                }
+                logging.debug("[Transfer] Transfer log: %s", json.dumps(transfer_log, default=str))
             return False
-        
-        # 验证参数并记录详细信息（与测试脚本保持一致）
-        logging.info("[Transfer] Step 2 parameters: from_funding_config=%s, from_main_account_id=%s, to_funding_address=%s, to_main_account_id=%s, amount=%s",
-                     from_funding_config.name, from_main_account_id, to_funding_config.funding_address, to_main_account_id, amount)
         
         step2_success, step2_info = transfer_funding_to_funding(
             from_funding_config=from_funding_config,
@@ -1655,7 +1632,7 @@ def transfer_between_trading_accounts_via_funding(
         )
         
         if not step2_success:
-            logging.error("[Transfer] Step 2 failed: funding → funding (external)")
+            logging.error("[Transfer] Step 2/3 failed: funding → funding (external)")
             logging.error("[Transfer] ⚠️  这需要使用 %s 的 funding 账户 API key，需要 External Transfer 权限", from_funding_config.name)
             logging.error("[Transfer] 出问题的 API key: %s (账户类型: %s, 账户ID: %s)", 
                         from_funding_config.api_key[:8] + "...", from_funding_config.account_type, from_funding_config.account_id)
@@ -1671,25 +1648,27 @@ def transfer_between_trading_accounts_via_funding(
             if not rollback_success:
                 logging.error("[Transfer] Rollback failed! Funds may be stuck in %s funding account", from_funding_config.name)
             
-            transfer_log = {
-                "event_time": start_time,
-                "success": False,
-                "transfer_usdt": str(amount),
-                "step": 2,
-                "step_name": "funding_to_funding",
-                "error": step2_info.get("error", {}),
-                "rollback_attempted": True,
-                "rollback_success": rollback_success,
-                "tx_ids": {"step1": step1_tx_id}
-            }
-            logging.info("[Transfer] Transfer log: %s", json.dumps(transfer_log, default=str))
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                transfer_log = {
+                    "event_time": start_time,
+                    "success": False,
+                    "transfer_usdt": str(amount),
+                    "step": 2,
+                    "step_name": "funding_to_funding",
+                    "error": step2_info.get("error", {}),
+                    "rollback_attempted": True,
+                    "rollback_success": rollback_success,
+                    "tx_ids": {"step1": step1_tx_id}
+                }
+                logging.debug("[Transfer] Transfer log: %s", json.dumps(transfer_log, default=str))
             return False
         
         step2_tx_id = step2_info.get("tx_id")
-        logging.info("[Transfer] Step 2 completed (tx_id: %s)", step2_tx_id or "N/A")
+        logging.info("[Transfer] Step 2/3: %s → %s (tx_id: %s)", 
+                    from_funding_config.name, to_funding_config.name, step2_tx_id or "N/A")
         
         # 步骤3: B-funding → B-trading
-        logging.info("[Transfer] Step 3: %s funding → %s trading", 
+        logging.info("[Transfer] Step 3/3: %s → %s", 
                     to_funding_config.name, to_trading_config.name)
         step3_success, step3_info = transfer_funding_to_trading(
             to_funding_config, to_main_account_id,
@@ -1698,7 +1677,7 @@ def transfer_between_trading_accounts_via_funding(
         )
         
         if not step3_success:
-            logging.error("[Transfer] Step 3 failed: funding → trading")
+            logging.error("[Transfer] Step 3/3 failed: funding → trading")
             logging.error("[Transfer] ⚠️  这需要使用 %s 的 funding 账户 API key，需要 Internal Transfer 权限", to_funding_config.name)
             logging.error("[Transfer] 出问题的 API key: %s (账户类型: %s, 账户ID: %s)", 
                         to_funding_config.api_key[:8] + "...", to_funding_config.account_type, to_funding_config.account_id)
@@ -1713,17 +1692,58 @@ def transfer_between_trading_accounts_via_funding(
             from_funding_post = get_funding_account_balance(from_funding_client, currency)
             to_funding_post = get_funding_account_balance(to_funding_client, currency)
             
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                transfer_log = {
+                    "event_time": start_time,
+                    "success": False,
+                    "transfer_usdt": str(amount),
+                    "step": 3,
+                    "step_name": "funding_to_trading",
+                    "error": step3_info.get("error", {}),
+                    "funds_location": f"{to_funding_config.name} funding account",
+                    "tx_ids": {
+                        "step1": step1_tx_id,
+                        "step2": step2_tx_id
+                    },
+                    "balances_pre": {
+                        "from_trading": from_trading_pre,
+                        "to_trading": to_trading_pre,
+                        "from_funding": from_funding_pre,
+                        "to_funding": to_funding_pre
+                    },
+                    "balances_post": {
+                        "from_trading": from_trading_post,
+                        "to_trading": to_trading_post,
+                        "from_funding": from_funding_post,
+                        "to_funding": to_funding_post
+                    }
+                }
+                logging.debug("[Transfer] Transfer log: %s", json.dumps(transfer_log, default=str))
+            return False
+        
+        step3_tx_id = step3_info.get("tx_id")
+        logging.info("[Transfer] Step 3/3: %s → %s (tx_id: %s)", 
+                    to_funding_config.name, to_trading_config.name, step3_tx_id or "N/A")
+        
+        # 获取转账后余额
+        from_trading_post = get_account_summary(from_trading_client)
+        to_trading_post = get_account_summary(to_trading_client)
+        from_funding_post = get_funding_account_balance(from_funding_client, currency)
+        to_funding_post = get_funding_account_balance(to_funding_client, currency)
+        
+        # 记录完整的转账日志（仅在 DEBUG 模式下）
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
             transfer_log = {
                 "event_time": start_time,
-                "success": False,
+                "success": True,
                 "transfer_usdt": str(amount),
-                "step": 3,
-                "step_name": "funding_to_trading",
-                "error": step3_info.get("error", {}),
-                "funds_location": f"{to_funding_config.name} funding account",
+                "currency": currency,
+                "from_trading": from_trading_config.name,
+                "to_trading": to_trading_config.name,
                 "tx_ids": {
-                    "step1": step1_tx_id,
-                    "step2": step2_tx_id
+                    "step1_trading_to_funding": step1_tx_id,
+                    "step2_funding_to_funding": step2_tx_id,
+                    "step3_funding_to_trading": step3_tx_id
                 },
                 "balances_pre": {
                     "from_trading": from_trading_pre,
@@ -1738,48 +1758,12 @@ def transfer_between_trading_accounts_via_funding(
                     "to_funding": to_funding_post
                 }
             }
-            logging.info("[Transfer] Transfer log: %s", json.dumps(transfer_log, default=str))
-            return False
+            logging.debug("[Transfer] Transfer log: %s", json.dumps(transfer_log, default=str))
         
-        step3_tx_id = step3_info.get("tx_id")
-        logging.info("[Transfer] Step 3 completed (tx_id: %s)", step3_tx_id or "N/A")
-        
-        # 获取转账后余额
-        from_trading_post = get_account_summary(from_trading_client)
-        to_trading_post = get_account_summary(to_trading_client)
-        from_funding_post = get_funding_account_balance(from_funding_client, currency)
-        to_funding_post = get_funding_account_balance(to_funding_client, currency)
-        
-        # 记录完整的转账日志
-        transfer_log = {
-            "event_time": start_time,
-            "success": True,
-            "transfer_usdt": str(amount),
-            "currency": currency,
-            "from_trading": from_trading_config.name,
-            "to_trading": to_trading_config.name,
-            "tx_ids": {
-                "step1_trading_to_funding": step1_tx_id,
-                "step2_funding_to_funding": step2_tx_id,
-                "step3_funding_to_trading": step3_tx_id
-            },
-            "balances_pre": {
-                "from_trading": from_trading_pre,
-                "to_trading": to_trading_pre,
-                "from_funding": from_funding_pre,
-                "to_funding": to_funding_pre
-            },
-            "balances_post": {
-                "from_trading": from_trading_post,
-                "to_trading": to_trading_post,
-                "from_funding": from_funding_post,
-                "to_funding": to_funding_post
-            }
-        }
-        logging.info("[Transfer] Transfer completed successfully. Transfer log: %s", json.dumps(transfer_log, default=str))
-        
-        logging.info("[Transfer] All steps completed successfully: %.2f %s transferred from %s to %s",
-                    amount, currency, from_trading_config.name, to_trading_config.name)
+        # 简洁的完成日志
+        logging.info("[Transfer] ✓ Completed: %.2f %s from %s to %s (tx_ids: %s, %s, %s)",
+                    amount, currency, from_trading_config.name, to_trading_config.name,
+                    step1_tx_id or "N/A", step2_tx_id or "N/A", step3_tx_id or "N/A")
         return True
         
     except Exception as exc:
@@ -1900,10 +1884,6 @@ def transfer_funding_to_funding(
         expiration_ns = str(int(time.time_ns() + 15 * 60 * 1_000_000_000))
         nonce = random.randint(1, 2**31 - 1)
         
-        logging.info("[%s] Building external transfer request: from_account_id=%s, from_sub_account_id=%s, to_account_id=%s (using %s), to_sub_account_id=%s, amount=%s, expiration=%s, nonce=%s",
-                     from_funding_config.name, from_account_id, "0", to_account_id, 
-                     "to_main_account_id" if to_main_account_id else "to_funding_address", "0", amount, expiration_ns, nonce)
-        
         # 确保所有参数都转换为字符串（参考实现使用 str() 转换所有参数）
         transfer = Transfer(
             from_account_id=str(from_account_id),  # 转出账户的 funding_address（根据参考代码，应该使用 funding_address）
@@ -1947,16 +1927,6 @@ def transfer_funding_to_funding(
             transfer_metadata=signed_transfer.transfer_metadata
         )
         
-        # 记录完整的请求参数（签名后）
-        logging.info("[%s] Transfer request details (after signing): from_account_id=%s, from_sub_account_id=%s, to_account_id=%s, to_sub_account_id=%s, currency=%s, num_tokens=%s",
-                     from_funding_config.name,
-                     transfer_request.from_account_id,
-                     transfer_request.from_sub_account_id,
-                     transfer_request.to_account_id,
-                     transfer_request.to_sub_account_id,
-                     transfer_request.currency,
-                     transfer_request.num_tokens)
-        
         # 使用重试机制执行转账
         success, tx_info = try_transfer_with_retry(
             client, transfer_request, retries=2, backoff_ms=1500, account_name=from_funding_config.name
@@ -1998,8 +1968,7 @@ def transfer_funding_to_funding(
             return False, tx_info
         
         tx_id = tx_info.get("tx_id")
-        logging.info("[%s] Transferred %.2f %s from funding account to external funding account (address: %s, tx_id: %s)", 
-                    from_funding_config.name, amount, currency, to_funding_address, tx_id or "N/A")
+        # Success log removed - will be logged at TransferFlow level
         return True, tx_info
         
     except Exception as exc:
@@ -2057,11 +2026,17 @@ def main() -> None:
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
     
-    # 设置 GRVT SDK 的日志级别（用于查看SDK内部的认证过程）
+    # 设置 GRVT SDK 的日志级别（默认完全静默，减少冗余日志）
     # SDK 使用 'grvt_raw_' 前缀的 logger
+    # 设置为 ERROR 级别以完全静默 SDK 内部的 cookie 刷新和 HTTP 请求日志
+    sdk_log_level = logging.ERROR if log_level_value != logging.DEBUG else log_level_value
+    # 预先设置已知的 SDK logger 名称
+    logging.getLogger('grvt_raw_').setLevel(sdk_log_level)
+    logging.getLogger('pysdk').setLevel(sdk_log_level)
+    # 遍历已存在的 logger 并设置级别
     for logger_name in logging.Logger.manager.loggerDict:
         if 'grvt' in logger_name.lower() or 'pysdk' in logger_name.lower():
-            logging.getLogger(logger_name).setLevel(log_level_value)
+            logging.getLogger(logger_name).setLevel(sdk_log_level)
     
     if log_level_value == logging.DEBUG:
         logging.info("Debug logging enabled. Set GRVT_LOG_LEVEL=INFO to reduce verbosity.")
@@ -2312,24 +2287,28 @@ def main() -> None:
                 )
             
             if transfer_info:
-                logging.info("[Auto-Balance] Transfer decision: %s", transfer_info.get("reason", "N/A"))
-            else:
-                logging.debug("[Auto-Balance] No transfer needed at this time")
-            
-            if transfer_info:
                 # 检查是否在冷却期内（防止频繁转账，至少间隔5分钟）
                 transfer_key = f"{transfer_info['from_account']}_to_{transfer_info['to_account']}"
                 current_time = time.time()
                 if transfer_key in last_transfer_time:
                     time_since_last = current_time - last_transfer_time[transfer_key]
                     if time_since_last < 300:  # 5分钟冷却期
-                        logging.info("Transfer skipped: cooling down (%.0f seconds remaining)", 300 - time_since_last)
+                        logging.info("[Auto-Balance] Transfer skipped: cooling down (%.0f seconds remaining)", 300 - time_since_last)
                         transfer_info = None
                 
                 if transfer_info:
                     from_account_name = transfer_info["from_account"]
                     to_account_name = transfer_info["to_account"]
                     transfer_amount = transfer_info["amount"]
+                    account1_percent = transfer_info.get("account1_percent", 0)
+                    account2_percent = transfer_info.get("account2_percent", 0)
+                    
+                    # 单条清晰的再平衡日志
+                    from_percent = account1_percent if from_account_name == account1_name else account2_percent
+                    to_percent = account1_percent if to_account_name == account1_name else account2_percent
+                    logging.info("[Auto-Balance] Rebalancing: Transferring %.2f USDT from %s to %s (%s: %.2f%%, %s: %.2f%%)",
+                                transfer_amount, from_account_name, to_account_name,
+                                from_account_name, from_percent, to_account_name, to_percent)
                     
                     from_config = clients[from_account_name]["config"]
                     to_config = clients[to_account_name]["config"]
@@ -2349,10 +2328,6 @@ def main() -> None:
                         logging.error("[Auto-Balance] Missing main account ID for transfer (from: %s, to: %s)",
                                     from_account_name, to_account_name)
                         continue
-                    
-                    logging.warning("[Auto-Balance] %s", transfer_info["reason"])
-                    logging.info("[Auto-Balance] Transferring %.2f USDT from %s to %s", 
-                               transfer_amount, from_account_name, to_account_name)
                     
                     # 尝试使用通过 funding 账户中转的转账路径（更安全）
                     # 查找关联的资金账户配置
@@ -2408,7 +2383,7 @@ def main() -> None:
                         continue
                     
                     # 使用通过 funding 账户中转的转账路径（必需）
-                    logging.info("[Auto-Balance] Using transfer via funding accounts (required path)")
+                    # Using transfer via funding accounts (required path)
                     success = transfer_between_trading_accounts_via_funding(
                         from_config, from_funding_config,
                         to_funding_config, to_config,
