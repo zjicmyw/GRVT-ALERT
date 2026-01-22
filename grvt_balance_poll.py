@@ -2318,13 +2318,13 @@ def main() -> None:
                 )
             
             if transfer_info:
-                # 检查是否在冷却期内（防止频繁转账，至少间隔5分钟）
+                # 检查是否在冷却期内（防止频繁转账，至少间隔30s冷却期）
                 transfer_key = f"{transfer_info['from_account']}_to_{transfer_info['to_account']}"
                 current_time = time.time()
                 if transfer_key in last_transfer_time:
                     time_since_last = current_time - last_transfer_time[transfer_key]
-                    if time_since_last < 300:  # 5分钟冷却期
-                        logging.info("[Auto-Balance] Transfer skipped: cooling down (%.0f seconds remaining)", 300 - time_since_last)
+                    if time_since_last < 30:  # 30s冷却期
+                        logging.info("[Auto-Balance] Transfer skipped: cooling down (%.0f seconds remaining)", 30 - time_since_last)
                         transfer_info = None
                 
                 if transfer_info:
