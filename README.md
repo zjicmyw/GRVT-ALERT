@@ -204,6 +204,79 @@ sudo systemctl enable grvt-balance-poll
 sudo systemctl disable grvt-balance-poll
 ```
 
+### 更新服务
+
+**重要**：更新代码文件后，必须清除 Python 缓存才能确保新代码生效。
+
+**一行命令快速更新**：
+
+```bash
+# 同时更新 Python 文件和 .env 文件（推荐）
+chmod +x update_service.sh && dos2unix update_service.sh 2>/dev/null || true && sudo ./update_service.sh ./grvt_balance_poll.py ./.env
+
+# 仅更新 Python 文件
+chmod +x update_service.sh && dos2unix update_service.sh 2>/dev/null || true && sudo ./update_service.sh ./grvt_balance_poll.py
+
+# 仅更新 .env 文件
+chmod +x update_service.sh && dos2unix update_service.sh 2>/dev/null || true && sudo ./update_service.sh '' ./.env
+```
+
+**详细使用方法**：
+
+```bash
+# 确保脚本有执行权限并修复行尾符
+chmod +x update_service.sh
+dos2unix update_service.sh 2>/dev/null || true
+
+# 更新 Python 文件
+sudo ./update_service.sh ./grvt_balance_poll.py
+
+# 同时更新 Python 文件和 .env 文件
+sudo ./update_service.sh ./grvt_balance_poll.py ./.env
+
+# 仅更新 .env 文件
+sudo ./update_service.sh '' ./.env
+
+# 或者仅清除缓存和重启（不更新文件）
+sudo ./update_service.sh
+```
+
+**方法 2：手动更新**
+
+```bash
+# 1. 停止服务并等待
+sudo systemctl stop grvt-balance-poll
+sleep 2
+
+# 2. 清除 Python 缓存（重要！）
+sudo find /opt/grvt-balance-poll -type d -name __pycache__ -exec rm -r {} + 2>/dev/null || true
+sudo find /opt/grvt-balance-poll -name "*.pyc" -delete 2>/dev/null || true
+
+# 3. 备份当前文件（可选）
+sudo cp /opt/grvt-balance-poll/grvt_balance_poll.py /opt/grvt-balance-poll/grvt_balance_poll.py.backup
+sudo cp /opt/grvt-balance-poll/.env /opt/grvt-balance-poll/.env.backup
+
+# 4. 替换文件（使用 scp、rsync 等方式上传新文件）
+# scp grvt_balance_poll.py user@server:/opt/grvt-balance-poll/
+# scp .env user@server:/opt/grvt-balance-poll/
+
+# 5. 设置权限
+sudo chown grvt:grvt /opt/grvt-balance-poll/grvt_balance_poll.py
+sudo chmod 644 /opt/grvt-balance-poll/grvt_balance_poll.py
+sudo chown grvt:grvt /opt/grvt-balance-poll/.env
+sudo chmod 600 /opt/grvt-balance-poll/.env
+
+# 6. 重启服务
+sudo systemctl restart grvt-balance-poll
+
+# 7. 验证
+sudo systemctl status grvt-balance-poll
+```
+
+**为什么需要清除缓存？**
+
+Python 会将 `.py` 文件编译为 `.pyc` 字节码文件并缓存在 `__pycache__` 目录中。如果只替换 `.py` 文件而不清除缓存，Python 可能会继续使用旧的字节码文件，导致代码更新不生效。
+
 ### 卸载服务
 
 ```bash

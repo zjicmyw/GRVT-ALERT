@@ -111,6 +111,8 @@ def build_client(account_config: AccountConfig) -> GrvtRawSync:
                 # 检查是否是 IP 白名单问题
                 # 注意：code=1000 且登录返回 text/plain 时，通常是 IP 白名单问题
                 if error_code == 1008 or 'whitelist' in error_msg.lower() or 'ip' in error_msg.lower() or (error_code == 1000 and 'authenticate' in error_msg.lower()):
+                    # INSERT_YOUR_CODE
+                    logging.error("[%s] (调试) 当前 API key: %s", account_config.name, account_config.api_key)
                     logging.error("[%s] ⚠️  IP 地址未在白名单中！", account_config.name)
                     logging.error("[%s] 请在 GRVT 网页端（Settings > API Keys）为 API key 添加当前 IP 地址到白名单。", account_config.name)
                     logging.error("[%s] 查看当前 IP：https://api.ipify.org", account_config.name)
@@ -131,6 +133,7 @@ def build_client(account_config: AccountConfig) -> GrvtRawSync:
                 # 检查是否是 IP 白名单问题
                 # 注意：code=1000 且登录返回 text/plain 时，通常是 IP 白名单问题
                 if error_code == 1008 or 'whitelist' in error_msg.lower() or 'ip' in error_msg.lower() or (error_code == 1000 and 'authenticate' in error_msg.lower()):
+                    logging.error("[%s] (调试) 当前 API key: %s", account_config.name, account_config.api_key)
                     logging.error("[%s] ⚠️  IP 地址未在白名单中！", account_config.name)
                     logging.error("[%s] 请在 GRVT 网页端（Settings > API Keys）为 API key 添加当前 IP 地址到白名单。", account_config.name)
                     logging.error("[%s] 查看当前 IP：https://api.ipify.org", account_config.name)
@@ -2158,6 +2161,7 @@ def main() -> None:
                             error_msg_lower = error_msg.lower()
                             # code=1000 且包含 "authenticate" 时，通常是 IP 白名单问题（登录返回 text/plain）
                             if response.code == 1008 or 'whitelist' in error_msg_lower or 'ip' in error_msg_lower or (response.code == 1000 and 'authenticate' in error_msg_lower):
+                                logging.error("[%s] (调试) 当前 API key: %s", account_config.name, account_config.api_key)
                                 logging.error("[%s] ⚠️  IP 地址未在白名单中！", account_name)
                                 logging.error("[%s] 请在 GRVT 网页端（Settings > API Keys）为 API key 添加当前 IP 地址到白名单。", account_name)
                                 logging.error("[%s] 查看当前 IP：https://api.ipify.org", account_name)
@@ -2238,6 +2242,7 @@ def main() -> None:
                             error_msg_lower = error_msg.lower()
                             # code=1000 且包含 "authenticate" 时，通常是 IP 白名单问题（登录返回 text/plain）
                             if response.code == 1008 or 'whitelist' in error_msg_lower or 'ip' in error_msg_lower or (response.code == 1000 and 'authenticate' in error_msg_lower):
+                                logging.error("[%s] (调试) 当前 API key: %s", account_config.name, account_config.api_key)
                                 logging.error("[%s] ⚠️  IP 地址未在白名单中！", account_name)
                                 logging.error("[%s] 请在 GRVT 网页端（Settings > API Keys）为 API key 添加当前 IP 地址到白名单。", account_name)
                                 logging.error("[%s] 查看当前 IP：https://api.ipify.org", account_name)
