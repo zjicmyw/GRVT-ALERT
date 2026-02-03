@@ -31,8 +31,90 @@ from pysdk.grvt_fixed_types import Transfer
 from pysdk.grvt_raw_signing import sign_transfer
 
 ALERT_URL_TEMPLATE = "https://api.day.app/{device_key}/{title}?call=1&level=critical&sound=birdsong"
+# 可转余额不足告警：相同内容（同一账户+同一方向）在此秒数内只发一次
+INSUFFICIENT_BALANCE_ALERT_COOLDOWN_SEC = 20 * 60  # 20 分钟
 # 北京时间 UTC+8
 BEIJING_TZ = timezone(timedelta(hours=8))
+
+# 可转余额不足告警上次发送时间：key = f"{account_name}:{direction}" -> timestamp
+_last_insufficient_balance_alert_time: Dict[str, float] = {}
+# 发送到本地 Telegram 网关的错误告警冷却
+_last_telegram_error_time: Dict[str, float] = {}
+TELEGRAM_ERROR_COOLDOWN_SEC = 10 * 60
+TELEGRAM_LOCAL_ENDPOINT = "http://localhost:3000/send-message"
+
+# 每 2 小时发送一次两账号总余额（北京时间 0 点开始）
+_last_telegram_total_balance_hour: str | None = None
+
+
+class TelegramErrorHandler(logging.Handler):
+    """将 ERROR 级别日志发送到本地 Telegram 网关（相同内容 10 分钟只发一次）"""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            if record.levelno < logging.ERROR:
+                return
+            chat_id = os.getenv("CHAT_ID")
+            api_key = os.getenv("API_KEY")
+            if not chat_id or not api_key:
+                return
+            base_message = record.getMessage()
+            message = f"[{record.levelname}] {record.name}: {base_message}"
+            now = time.time()
+            last_sent = _last_telegram_error_time.get(message, 0.0)
+            if now - last_sent < TELEGRAM_ERROR_COOLDOWN_SEC:
+                return
+            headers = {
+                "Content-Type": "application/json",
+                "X-API-Key": api_key,
+            }
+            payload = {
+                "chatId": chat_id,
+                "message": message,
+            }
+            requests.post(TELEGRAM_LOCAL_ENDPOINT, json=payload, headers=headers, timeout=5)
+            _last_telegram_error_time[message] = now
+        except Exception:
+            # 不影响主流程
+            return
+
+
+def send_telegram_message(message: str) -> None:
+    """通过本地 Telegram 网关发送消息"""
+    try:
+        chat_id = os.getenv("CHAT_ID")
+        api_key = os.getenv("API_KEY")
+        if not chat_id or not api_key:
+            return
+        headers = {
+            "Content-Type": "application/json",
+            "X-API-Key": api_key,
+        }
+        payload = {
+            "chatId": chat_id,
+            "message": message,
+        }
+        requests.post(TELEGRAM_LOCAL_ENDPOINT, json=payload, headers=headers, timeout=5)
+    except Exception:
+        return
+
+
+def should_send_telegram_total_balance() -> bool:
+    """北京时间 0 点起每 2 小时发送一次"""
+    try:
+        beijing_now = datetime.now(BEIJING_TZ)
+        if beijing_now.minute != 0:
+            return False
+        if beijing_now.hour % 2 != 0:
+            return False
+        current_key = beijing_now.strftime("%Y-%m-%d-%H")
+        global _last_telegram_total_balance_hour
+        if _last_telegram_total_balance_hour == current_key:
+            return False
+        _last_telegram_total_balance_hour = current_key
+        return True
+    except Exception:
+        return False
 
 
 @dataclass
@@ -111,8 +193,6 @@ def build_client(account_config: AccountConfig) -> GrvtRawSync:
                 # 检查是否是 IP 白名单问题
                 # 注意：code=1000 且登录返回 text/plain 时，通常是 IP 白名单问题
                 if error_code == 1008 or 'whitelist' in error_msg.lower() or 'ip' in error_msg.lower() or (error_code == 1000 and 'authenticate' in error_msg.lower()):
-                    # INSERT_YOUR_CODE
-                    logging.error("[%s] (调试) 当前 API key: %s", account_config.name, account_config.api_key)
                     logging.error("[%s] ⚠️  IP 地址未在白名单中！", account_config.name)
                     logging.error("[%s] 请在 GRVT 网页端（Settings > API Keys）为 API key 添加当前 IP 地址到白名单。", account_config.name)
                     logging.error("[%s] 查看当前 IP：https://api.ipify.org", account_config.name)
@@ -133,7 +213,6 @@ def build_client(account_config: AccountConfig) -> GrvtRawSync:
                 # 检查是否是 IP 白名单问题
                 # 注意：code=1000 且登录返回 text/plain 时，通常是 IP 白名单问题
                 if error_code == 1008 or 'whitelist' in error_msg.lower() or 'ip' in error_msg.lower() or (error_code == 1000 and 'authenticate' in error_msg.lower()):
-                    logging.error("[%s] (调试) 当前 API key: %s", account_config.name, account_config.api_key)
                     logging.error("[%s] ⚠️  IP 地址未在白名单中！", account_config.name)
                     logging.error("[%s] 请在 GRVT 网页端（Settings > API Keys）为 API key 添加当前 IP 地址到白名单。", account_config.name)
                     logging.error("[%s] 查看当前 IP：https://api.ipify.org", account_config.name)
@@ -152,6 +231,92 @@ def build_client(account_config: AccountConfig) -> GrvtRawSync:
         if 'whitelist' in error_msg.lower() or 'IP' in error_msg:
             logging.error("[%s] ⚠️  可能是 IP 地址未在白名单中的问题！", account_config.name)
             logging.error("[%s] 请在 GRVT 网页端（Settings > API Keys）为 API key 添加当前 IP 地址到白名单。", account_config.name)
+    
+    return client
+
+
+def reauthenticate_client(account_config: AccountConfig, account_name: str) -> GrvtRawSync:
+    """重新认证客户端。
+    
+    当遇到 401 认证错误时，重新创建客户端以触发重新认证。
+    
+    Args:
+        account_config: 账户配置
+        account_name: 账户名称（用于日志）
+    
+    Returns:
+        重新认证后的客户端
+    """
+    logging.info("[%s] 重新认证客户端...", account_name)
+    try:
+        new_client = build_client(account_config)
+        logging.info("[%s] 客户端重新认证成功", account_name)
+        return new_client
+    except Exception as exc:
+        logging.error("[%s] 客户端重新认证失败: %s", account_name, exc)
+        raise
+
+
+def ensure_authenticated(
+    client: GrvtRawSync, 
+    account_config: AccountConfig, 
+    account_name: str,
+    clients_dict: Dict[str, Any] | None = None
+) -> GrvtRawSync:
+    """确保客户端已认证。
+    
+    在调用需要认证的 API 之前，先进行认证检查。
+    如果认证失败（401错误），会重新认证并更新客户端。
+    
+    Args:
+        client: 当前客户端
+        account_config: 账户配置
+        account_name: 账户名称
+        clients_dict: 客户端字典（如果提供，会更新其中的客户端）
+    
+    Returns:
+        已认证的客户端
+    """
+    # 对于交易账户，使用 aggregated_account_summary_v1 进行认证检查
+    # 对于资金账户，使用 funding_account_summary_v1 进行认证检查
+    try:
+        if account_config.account_type == "trading":
+            # 先进行一次轻量级调用以触发认证（如果未认证）
+            test_response = client.aggregated_account_summary_v1(EmptyRequest())
+            if isinstance(test_response, GrvtError):
+                error_code = getattr(test_response, 'code', '')
+                error_msg = getattr(test_response, 'message', '') or ''
+                # 检查是否是认证错误（401 或 code=1000 且包含 authenticate）
+                if (test_response.status == 401 or 
+                    (error_code == 1000 and 'authenticate' in error_msg.lower())):
+                    logging.warning("[%s] 检测到认证错误，尝试重新认证: code=%s status=%s", 
+                                  account_name, error_code, test_response.status)
+                    # 重新认证
+                    new_client = reauthenticate_client(account_config, account_name)
+                    # 更新客户端字典
+                    if clients_dict is not None:
+                        clients_dict[account_name]["client"] = new_client
+                    return new_client
+        elif account_config.account_type == "funding":
+            # 对于资金账户，使用 funding_account_summary_v1
+            test_response = client.funding_account_summary_v1(EmptyRequest())
+            if isinstance(test_response, GrvtError):
+                error_code = getattr(test_response, 'code', '')
+                error_msg = getattr(test_response, 'message', '') or ''
+                # 检查是否是认证错误（401 或 code=1000 且包含 authenticate）
+                if (test_response.status == 401 or 
+                    (error_code == 1000 and 'authenticate' in error_msg.lower())):
+                    logging.warning("[%s] 检测到认证错误，尝试重新认证: code=%s status=%s", 
+                                  account_name, error_code, test_response.status)
+                    # 重新认证
+                    new_client = reauthenticate_client(account_config, account_name)
+                    # 更新客户端字典
+                    if clients_dict is not None:
+                        clients_dict[account_name]["client"] = new_client
+                    return new_client
+    except Exception as exc:
+        # 如果测试调用失败（可能是网络问题等），记录但不阻止
+        logging.debug("[%s] 认证检查时出现异常（可能是临时问题）: %s", account_name, exc)
     
     return client
 
@@ -309,6 +474,41 @@ def send_alert(account_name: str, total_equity: float, threshold: float) -> None
         logging.error("[%s] Error sending alert: %s", account_name, exc)
 
 
+def send_insufficient_transfer_balance_alert(
+    account_name: str,
+    available_balance: float,
+    required_amount: float,
+    direction: str = "Trading→Funding",
+    currency: str = "USDT"
+) -> None:
+    """发送「可转余额不足」告警。相同内容（同一账户+同一方向）20 分钟内只发一次。"""
+    global _last_insufficient_balance_alert_time
+    try:
+        device_key = os.getenv("GRVT_ALERT_DEVICE_KEY")
+        if not device_key:
+            logging.warning("[%s] GRVT_ALERT_DEVICE_KEY 未配置，无法发送可转余额不足告警", account_name)
+            return
+        alert_key = f"{account_name}:{direction}"
+        now = time.time()
+        last_sent = _last_insufficient_balance_alert_time.get(alert_key, 0.0)
+        if now - last_sent < INSUFFICIENT_BALANCE_ALERT_COOLDOWN_SEC:
+            logging.debug("[%s] 可转余额不足告警在冷却期内（距上次 %.0f 秒），跳过发送", account_name, now - last_sent)
+            return
+        alert_url_template = os.getenv("GRVT_ALERT_URL", ALERT_URL_TEMPLATE)
+        title = f"GRVT {account_name} 可转余额不足：{direction} 需要 {required_amount:.2f} {currency}，可用 {available_balance:.2f}"
+        encoded_title = requests.utils.quote(title)
+        url = alert_url_template.format(device_key=device_key, title=encoded_title)
+        response = requests.get(url, timeout=5)
+        if response.status_code == 200:
+            _last_insufficient_balance_alert_time[alert_key] = now
+            logging.warning("[%s] 已发送可转余额不足告警: 可用 %.2f，需要 %.2f %s (%s)",
+                          account_name, available_balance, required_amount, currency, direction)
+        else:
+            logging.error("[%s] 发送可转余额不足告警失败: HTTP %d", account_name, response.status_code)
+    except Exception as exc:
+        logging.error("[%s] 发送可转余额不足告警异常: %s", account_name, exc)
+
+
 def send_daily_summary(account_balances: Dict[str, float]) -> None:
     """发送每日余额正常汇总消息。"""
     try:
@@ -346,8 +546,10 @@ def send_daily_summary(account_balances: Dict[str, float]) -> None:
 def should_send_daily_summary() -> bool:
     """检查是否到了发送每日汇总的时间（北京时间）。"""
     try:
-        # 获取配置的发送时间，格式：HH:MM，默认 16:30
-        send_time_str = os.getenv("GRVT_DAILY_SUMMARY_TIME", "16:30")
+        # 获取配置的发送时间，格式：HH:MM。未配置则不发送
+        send_time_str = (os.getenv("GRVT_DAILY_SUMMARY_TIME") or "").strip()
+        if not send_time_str or send_time_str == "-":
+            return False
         hour, minute = map(int, send_time_str.split(":"))
         
         # 获取当前北京时间
@@ -415,22 +617,60 @@ def get_funding_account_balance(client: GrvtRawSync, currency: str = "USDT") -> 
         return None
 
 
-def get_trading_account_balance(client: GrvtRawSync, currency: str = "USDT") -> float | None:
+def get_trading_account_balance(
+    client: GrvtRawSync, 
+    currency: str = "USDT",
+    account_config: AccountConfig | None = None,
+    account_name: str = "",
+    clients_dict: Dict[str, Any] | None = None
+) -> float | None:
     """获取交易账户的指定币种余额。
     
     Args:
         client: GRVT客户端（交易账户）
         currency: 币种，默认USDT
+        account_config: 账户配置（用于重新认证）
+        account_name: 账户名称（用于日志和重新认证）
+        clients_dict: 客户端字典（用于更新客户端）
     
     Returns:
         余额（float），如果失败返回None
     """
     try:
+        # 确保认证（如果提供了配置）
+        if account_config and account_name:
+            client = ensure_authenticated(client, account_config, account_name, clients_dict)
+        
         response = client.aggregated_account_summary_v1(EmptyRequest())
         if isinstance(response, GrvtError):
-            logging.debug("Failed to get trading account balance: code=%s status=%s message=%s",
-                        response.code, response.status, getattr(response, 'message', ''))
-            return None
+            error_code = getattr(response, 'code', '')
+            error_msg = getattr(response, 'message', '') or ''
+            # 如果是认证错误，尝试重新认证并重试一次
+            if (response.status == 401 or 
+                (error_code == 1000 and 'authenticate' in error_msg.lower())):
+                if account_config and account_name:
+                    logging.warning("[%s] 获取余额时遇到认证错误，尝试重新认证后重试", account_name)
+                    try:
+                        new_client = reauthenticate_client(account_config, account_name)
+                        if clients_dict is not None:
+                            clients_dict[account_name]["client"] = new_client
+                        # 重试一次
+                        response = new_client.aggregated_account_summary_v1(EmptyRequest())
+                        if isinstance(response, GrvtError):
+                            logging.debug("Failed to get trading account balance after re-auth: code=%s status=%s message=%s",
+                                        response.code, response.status, getattr(response, 'message', ''))
+                            return None
+                    except Exception as exc:
+                        logging.error("[%s] 重新认证失败: %s", account_name, exc)
+                        return None
+                else:
+                    logging.debug("Failed to get trading account balance: code=%s status=%s message=%s",
+                                response.code, response.status, error_msg)
+                    return None
+            else:
+                logging.debug("Failed to get trading account balance: code=%s status=%s message=%s",
+                            response.code, response.status, error_msg)
+                return None
         
         # 查找指定币种的余额
         if hasattr(response, 'result') and hasattr(response.result, 'spot_balances'):
@@ -444,21 +684,61 @@ def get_trading_account_balance(client: GrvtRawSync, currency: str = "USDT") -> 
         return None
 
 
-def get_account_summary(client: GrvtRawSync) -> Dict[str, float] | None:
+def get_account_summary(
+    client: GrvtRawSync,
+    account_config: AccountConfig | None = None,
+    account_name: str = "",
+    clients_dict: Dict[str, Any] | None = None
+) -> Dict[str, float] | None:
     """获取账户摘要信息（总权益、可用余额、维持保证金）。
+    
+    Args:
+        client: GRVT客户端
+        account_config: 账户配置（用于重新认证）
+        account_name: 账户名称（用于日志和重新认证）
+        clients_dict: 客户端字典（用于更新客户端）
     
     Returns:
         包含 equity, available_balance, maintenance_margin 的字典，失败返回 None
     """
     try:
+        # 确保认证（如果提供了配置）
+        if account_config and account_name:
+            client = ensure_authenticated(client, account_config, account_name, clients_dict)
+        
         logging.debug("Calling aggregated_account_summary_v1...")
         response = client.aggregated_account_summary_v1(EmptyRequest())
         logging.debug("aggregated_account_summary_v1 response type: %s", type(response).__name__)
         
         if isinstance(response, GrvtError):
-            logging.error("Failed to get account summary: code=%s status=%s message=%s", 
-                        response.code, response.status, getattr(response, 'message', ''))
-            return None
+            error_code = getattr(response, 'code', '')
+            error_msg = getattr(response, 'message', '') or ''
+            # 如果是认证错误，尝试重新认证并重试一次
+            if (response.status == 401 or 
+                (error_code == 1000 and 'authenticate' in error_msg.lower())):
+                if account_config and account_name:
+                    logging.warning("[%s] 获取账户摘要时遇到认证错误，尝试重新认证后重试", account_name)
+                    try:
+                        new_client = reauthenticate_client(account_config, account_name)
+                        if clients_dict is not None:
+                            clients_dict[account_name]["client"] = new_client
+                        # 重试一次
+                        response = new_client.aggregated_account_summary_v1(EmptyRequest())
+                        if isinstance(response, GrvtError):
+                            logging.error("[%s] Failed to get account summary after re-auth: code=%s status=%s message=%s", 
+                                        account_name, response.code, response.status, error_msg)
+                            return None
+                    except Exception as exc:
+                        logging.error("[%s] 重新认证失败: %s", account_name, exc)
+                        return None
+                else:
+                    logging.error("Failed to get account summary: code=%s status=%s message=%s", 
+                                response.code, response.status, error_msg)
+                    return None
+            else:
+                logging.error("Failed to get account summary: code=%s status=%s message=%s", 
+                            response.code, response.status, error_msg)
+                return None
         
         result = response.result
         logging.debug("Account summary result: total_equity=%s, has_available_balance=%s, has_maintenance_margin=%s",
@@ -489,7 +769,10 @@ def get_account_summary(client: GrvtRawSync) -> Dict[str, float] | None:
 def verify_transfer_balance(
     client: GrvtRawSync,
     required_amount: float,
-    currency: str = "USDT"
+    currency: str = "USDT",
+    account_config: AccountConfig | None = None,
+    account_name: str = "",
+    clients_dict: Dict[str, Any] | None = None
 ) -> bool:
     """验证账户是否有足够的余额进行转账。
     
@@ -499,12 +782,15 @@ def verify_transfer_balance(
         client: GRVT客户端
         required_amount: 需要的转账金额
         currency: 币种，默认USDT
+        account_config: 账户配置（可选，用于重新认证）
+        account_name: 账户名称（可选，用于日志和重新认证）
+        clients_dict: 客户端字典（可选，用于更新客户端）
     
     Returns:
         是否有足够的余额
     """
     try:
-        summary = get_account_summary(client)
+        summary = get_account_summary(client, account_config, account_name, clients_dict)
         if not summary:
             logging.warning("Cannot verify balance: failed to get account summary")
             return True  # 如果无法获取，假设有余额（避免阻塞转账）
@@ -1097,7 +1383,7 @@ def transfer_between_trading_accounts(
         from_client = build_client(from_config)
         
         # 验证余额（可选，如果余额不足会在API调用时失败）
-        if not verify_transfer_balance(from_client, amount, currency):
+        if not verify_transfer_balance(from_client, amount, currency, from_config, from_config.name):
             logging.warning("[%s] Balance verification failed, but proceeding with transfer (API will reject if insufficient)",
                           from_config.name)
         
@@ -1166,8 +1452,7 @@ def transfer_between_trading_accounts(
             if (error_code == 1001 or error_status == 403 or 
                 'permission' in error_msg_lower or 'unauthorized' in error_msg_lower or 'not authorized' in error_msg_lower):
                 logging.error("[%s] ⚠️  API key 没有转账权限！", from_config.name)
-                logging.error("[%s] 出问题的 API key: %s (账户类型: %s, 账户ID: %s)", 
-                            from_config.name, from_config.api_key[:8] + "...", from_config.account_type, from_config.account_id)
+                logging.error("[%s] 请检查该账户的 API key 权限与账户类型/ID 是否匹配", from_config.name)
                 logging.error("[%s] 请在 GRVT 网页端（Settings > API Keys）检查并更新此 API key 的权限（需要 Transfer 权限）。", from_config.name)
             elif 'insufficient' in error_msg_lower or 'balance' in error_msg_lower:
                 logging.error("[%s] Insufficient balance for transfer. Please check account balance.",
@@ -1184,8 +1469,7 @@ def transfer_between_trading_accounts(
         # 检查是否是 API key 相关错误
         if 'api' in error_msg.lower() or 'key' in error_msg.lower() or 'permission' in error_msg.lower():
             logging.error("[%s] ⚠️  可能是 API key 问题！", from_config.name)
-            logging.error("[%s] 出问题的 API key: %s (账户类型: %s)", 
-                        from_config.name, from_config.api_key[:8] + "...", from_config.account_type)
+            logging.error("[%s] 请检查该账户的 API key 权限与账户类型是否匹配", from_config.name)
         return False
 
 
@@ -1234,10 +1518,15 @@ def transfer_trading_to_funding(
         # 使用交易账户的客户端
         client = build_client(trading_config)
         
-        # 验证余额（可选，如果余额不足会在API调用时失败）
-        if not verify_transfer_balance(client, amount, currency):
-            logging.warning("[%s] Balance verification failed, but proceeding with transfer (API will reject if insufficient)",
-                          trading_config.name)
+        # 验证可转余额；不足时告警，但继续尝试转账（由 API 最终判定）
+        if not verify_transfer_balance(client, amount, currency, trading_config, trading_config.name):
+            summary = get_account_summary(client, trading_config, trading_config.name)
+            available = float(summary.get("available_balance", 0.0)) if summary else 0.0
+            logging.warning("[%s] 可转余额不足: 可用 %.2f %s，需要 %.2f，已发送告警并继续尝试转账",
+                          trading_config.name, available, currency, amount)
+            send_insufficient_transfer_balance_alert(
+                trading_config.name, available, amount, "Trading→Funding", currency
+            )
         
         account = Account.from_key(trading_config.private_key)
         
@@ -1309,12 +1598,15 @@ def transfer_trading_to_funding(
             if (error_code == 1001 or error_status == 403 or 
                 'permission' in error_msg_lower or 'unauthorized' in error_msg_lower or 'not authorized' in error_msg_lower):
                 logging.error("[%s] ⚠️  API key 没有转账权限！", trading_config.name)
-                logging.error("[%s] 出问题的 API key: %s (账户类型: %s, 账户ID: %s)", 
-                            trading_config.name, trading_config.api_key[:8] + "...", trading_config.account_type, trading_config.account_id)
+                logging.error("[%s] 请检查该账户的 API key 权限与账户类型/ID 是否匹配", trading_config.name)
                 logging.error("[%s] 请在 GRVT 网页端（Settings > API Keys）检查并更新此 API key 的权限（需要 Internal Transfer 权限，从 Trading 到 Funding）。", trading_config.name)
             elif 'insufficient' in error_msg_lower or 'balance' in error_msg_lower:
                 logging.error("[%s] Insufficient balance for transfer. Please check account balance.",
                             trading_config.name)
+                # API 返回余额不足时也发送告警（与转账前校验不足告警一致）
+                send_insufficient_transfer_balance_alert(
+                    trading_config.name, 0.0, amount, "Trading→Funding", currency
+                )
             return False, tx_info
         
         tx_id = tx_info.get("tx_id")
@@ -1327,8 +1619,7 @@ def transfer_trading_to_funding(
         # 检查是否是 API key 相关错误
         if 'api' in error_msg.lower() or 'key' in error_msg.lower() or 'permission' in error_msg.lower():
             logging.error("[%s] ⚠️  可能是 API key 问题！", trading_config.name)
-            logging.error("[%s] 出问题的 API key: %s (账户类型: %s)", 
-                        trading_config.name, trading_config.api_key[:8] + "...", trading_config.account_type)
+            logging.error("[%s] 请检查该账户的 API key 权限与账户类型是否匹配", trading_config.name)
         return False, {"success": False, "error": {"exception": error_msg}, "message": error_msg}
 
 
@@ -1450,8 +1741,7 @@ def transfer_funding_to_trading(
             elif (error_code == 1001 or error_status == 403 or 
                   'permission' in error_msg_lower or 'unauthorized' in error_msg_lower or 'not authorized' in error_msg_lower):
                 logging.error("[%s] ⚠️  API key 没有转账权限！", funding_config.name)
-                logging.error("[%s] 出问题的 API key: %s (账户类型: %s, 账户ID: %s)", 
-                            funding_config.name, funding_config.api_key[:8] + "...", funding_config.account_type, funding_config.account_id)
+                logging.error("[%s] 请检查该账户的 API key 权限与账户类型/ID 是否匹配", funding_config.name)
                 logging.error("[%s] 请在 GRVT 网页端（Settings > API Keys）检查并更新此 API key 的权限（需要 Internal Transfer 权限，从 Funding 到 Trading）。", funding_config.name)
             return False, tx_info
         
@@ -1465,8 +1755,7 @@ def transfer_funding_to_trading(
         # 检查是否是 API key 相关错误
         if 'api' in error_msg.lower() or 'key' in error_msg.lower() or 'permission' in error_msg.lower():
             logging.error("[%s] ⚠️  可能是 API key 问题！", funding_config.name)
-            logging.error("[%s] 出问题的 API key: %s (账户类型: %s)", 
-                        funding_config.name, funding_config.api_key[:8] + "...", funding_config.account_type)
+            logging.error("[%s] 请检查该账户的 API key 权限与账户类型是否匹配", funding_config.name)
         return False, {"success": False, "error": {"exception": error_msg}, "message": error_msg}
 
 
@@ -1544,8 +1833,8 @@ def transfer_between_trading_accounts_via_funding(
         to_funding_client = build_client(to_funding_config)
         
         # 获取转账前余额
-        from_trading_pre = get_account_summary(from_trading_client)
-        to_trading_pre = get_account_summary(to_trading_client)
+        from_trading_pre = get_account_summary(from_trading_client, from_trading_config, from_trading_config.name)
+        to_trading_pre = get_account_summary(to_trading_client, to_trading_config, to_trading_config.name)
         from_funding_pre = get_funding_account_balance(from_funding_client, currency)
         to_funding_pre = get_funding_account_balance(to_funding_client, currency)
         
@@ -1561,8 +1850,7 @@ def transfer_between_trading_accounts_via_funding(
         if not step1_success:
             logging.error("[Transfer] Step 1/3 failed: trading → funding")
             logging.error("[Transfer] ⚠️  这需要使用 %s 的 trading 账户 API key，需要 Internal Transfer 权限（从 Trading 到 Funding）", from_trading_config.name)
-            logging.error("[Transfer] 出问题的 API key: %s (账户类型: %s, 账户ID: %s)", 
-                        from_trading_config.api_key[:8] + "...", from_trading_config.account_type, from_trading_config.account_id)
+            logging.error("[Transfer] 请检查该账户的 API key 权限与账户类型/ID 是否匹配")
             logging.error("[Transfer] 请在 GRVT 网页端（Settings > API Keys）检查并更新此 API key 的权限")
             
             # 记录失败信息（仅在 DEBUG 模式下记录完整日志）
@@ -1638,8 +1926,7 @@ def transfer_between_trading_accounts_via_funding(
         if not step2_success:
             logging.error("[Transfer] Step 2/3 failed: funding → funding (external)")
             logging.error("[Transfer] ⚠️  这需要使用 %s 的 funding 账户 API key，需要 External Transfer 权限", from_funding_config.name)
-            logging.error("[Transfer] 出问题的 API key: %s (账户类型: %s, 账户ID: %s)", 
-                        from_funding_config.api_key[:8] + "...", from_funding_config.account_type, from_funding_config.account_id)
+            logging.error("[Transfer] 请检查该账户的 API key 权限与账户类型/ID 是否匹配")
             logging.error("[Transfer] 请在 GRVT 网页端（Settings > API Keys）检查并更新此 API key 的权限（需要 External Transfer 权限）")
             logging.error("[Transfer] 注意：目标地址 %s 必须在 Address Book 中预先登记", to_funding_config.funding_address)
             # 如果失败，尝试回滚：A-funding → A-trading
@@ -1683,16 +1970,15 @@ def transfer_between_trading_accounts_via_funding(
         if not step3_success:
             logging.error("[Transfer] Step 3/3 failed: funding → trading")
             logging.error("[Transfer] ⚠️  这需要使用 %s 的 funding 账户 API key，需要 Internal Transfer 权限", to_funding_config.name)
-            logging.error("[Transfer] 出问题的 API key: %s (账户类型: %s, 账户ID: %s)", 
-                        to_funding_config.api_key[:8] + "...", to_funding_config.account_type, to_funding_config.account_id)
+            logging.error("[Transfer] 请检查该账户的 API key 权限与账户类型/ID 是否匹配")
             logging.error("[Transfer] 请在 GRVT 网页端（Settings > API Keys）检查并更新此 API key 的权限（需要 Internal Transfer 权限，从 Funding 到 Trading）")
             # 如果失败，资金已经在 B-funding，记录错误但前两步已成功
             logging.warning("[Transfer] Funds are in %s funding account, manual intervention may be needed",
                           to_funding_config.name)
             
             # 获取转账后余额
-            from_trading_post = get_account_summary(from_trading_client)
-            to_trading_post = get_account_summary(to_trading_client)
+            from_trading_post = get_account_summary(from_trading_client, from_trading_config, from_trading_config.name)
+            to_trading_post = get_account_summary(to_trading_client, to_trading_config, to_trading_config.name)
             from_funding_post = get_funding_account_balance(from_funding_client, currency)
             to_funding_post = get_funding_account_balance(to_funding_client, currency)
             
@@ -1730,8 +2016,8 @@ def transfer_between_trading_accounts_via_funding(
                     to_funding_config.name, to_trading_config.name, step3_tx_id or "N/A")
         
         # 获取转账后余额
-        from_trading_post = get_account_summary(from_trading_client)
-        to_trading_post = get_account_summary(to_trading_client)
+        from_trading_post = get_account_summary(from_trading_client, from_trading_config, from_trading_config.name)
+        to_trading_post = get_account_summary(to_trading_client, to_trading_config, to_trading_config.name)
         from_funding_post = get_funding_account_balance(from_funding_client, currency)
         to_funding_post = get_funding_account_balance(to_funding_client, currency)
         
@@ -1864,7 +2150,7 @@ def transfer_funding_to_funding(
         client = build_client(from_funding_config)
         
         # 验证余额（可选，如果余额不足会在API调用时失败）
-        if not verify_transfer_balance(client, amount, currency):
+        if not verify_transfer_balance(client, amount, currency, from_funding_config, from_funding_config.name):
             logging.warning("[%s] Balance verification failed, but proceeding with transfer (API will reject if insufficient)",
                           from_funding_config.name)
         
@@ -1959,8 +2245,7 @@ def transfer_funding_to_funding(
             elif (error_code == 1001 or error_status == 403 or 
                   'permission' in error_msg_lower or 'unauthorized' in error_msg_lower or 'not authorized' in error_msg_lower):
                 logging.error("[%s] ⚠️  API key 没有外部转账权限！", from_funding_config.name)
-                logging.error("[%s] 出问题的 API key: %s (账户类型: %s, 账户ID: %s)", 
-                            from_funding_config.name, from_funding_config.api_key[:8] + "...", from_funding_config.account_type, from_funding_config.account_id)
+                logging.error("[%s] 请检查该账户的 API key 权限与账户类型/ID 是否匹配", from_funding_config.name)
                 logging.error("[%s] 请在 GRVT 网页端（Settings > API Keys）检查并更新此 API key 的权限（需要 External Transfer 权限）。", from_funding_config.name)
             elif 'insufficient' in error_msg_lower or 'balance' in error_msg_lower:
                 logging.error("[%s] Insufficient balance for transfer. Please check funding account balance.",
@@ -1983,8 +2268,7 @@ def transfer_funding_to_funding(
         # 检查是否是 API key 相关错误
         if 'api' in error_msg.lower() or 'key' in error_msg.lower() or 'permission' in error_msg.lower():
             logging.error("[%s] ⚠️  可能是 API key 问题！", from_funding_config.name)
-            logging.error("[%s] 出问题的 API key: %s (账户类型: %s)", 
-                        from_funding_config.name, from_funding_config.api_key[:8] + "...", from_funding_config.account_type)
+            logging.error("[%s] 请检查该账户的 API key 权限与账户类型是否匹配", from_funding_config.name)
         return False, {"success": False, "error": {"exception": error_msg}, "message": error_msg}
 
 
@@ -2039,7 +2323,13 @@ def main() -> None:
     
     # 清除已有的处理器（避免重复）
     root_logger.handlers.clear()
-    
+
+    # 本地 Telegram 错误告警处理器（ERROR 级别）
+    telegram_handler = TelegramErrorHandler()
+    telegram_handler.setLevel(logging.ERROR)
+    telegram_handler.setFormatter(logging.Formatter(log_format, date_format))
+    root_logger.addHandler(telegram_handler)
+
     # 文件日志处理器（带轮转，每天一个文件，保留30天）
     log_file = logs_dir / "grvt_balance_poll.log"
     file_handler = logging.handlers.TimedRotatingFileHandler(
@@ -2093,14 +2383,10 @@ def main() -> None:
                     "client": build_client(account_config),
                     "config": account_config
                 }
-                logging.info("Initialized client for %s (%s Account ID: %s)", 
-                           account_config.name, account_config.account_type.capitalize(), account_config.account_id)
-                
-                # 验证配置：记录关键信息（不泄露完整密钥）
-                api_key_preview = account_config.api_key[:8] + "..." if len(account_config.api_key) > 8 else account_config.api_key
-                private_key_preview = account_config.private_key[:8] + "..." if account_config.private_key and len(account_config.private_key) > 8 else (account_config.private_key or "None")
-                logging.debug("[%s] Config check: API key starts with '%s', Private key starts with '%s', Account ID='%s'", 
-                            account_config.name, api_key_preview, private_key_preview, account_config.account_id)
+                logging.info("Initialized client for %s (%s)", 
+                           account_config.name, account_config.account_type.capitalize())
+                logging.debug("[%s] Config check: type=%s",
+                            account_config.name, account_config.account_type)
             except Exception as exc:
                 logging.error("Failed to initialize client for %s: %s", account_config.name, exc)
                 sys.exit(1)
@@ -2112,9 +2398,15 @@ def main() -> None:
         logging.error("No valid account configurations found")
         sys.exit(1)
 
-    # 检查是否配置了两个账户用于自动平衡
-    if len(clients) < 2:
-        logging.warning("Auto-balance requires at least 2 accounts, but only %d configured", len(clients))
+    # 检查是否配置了两个交易账户用于自动平衡
+    trading_account_count = sum(
+        1 for data in clients.values() if data["config"].account_type == "trading"
+    )
+    if trading_account_count < 2:
+        logging.warning("Auto-balance requires at least 2 trading accounts, but only %d configured", trading_account_count)
+    elif trading_account_count > 2:
+        logging.warning("Auto-balance currently supports exactly 2 trading accounts; %d found, auto-balance will be skipped",
+                        trading_account_count)
     
     logging.info("GRVT balance polling started for %d account(s) (interval %ss)", 
                 len(clients), poll_interval)
@@ -2122,12 +2414,14 @@ def main() -> None:
     
     last_summary_date = None  # 记录上次发送每日汇总的日期
     last_transfer_time = {}  # 记录上次转账时间，防止频繁转账
+    funding_account_failures = {}  # Track consecutive failures per funding account
     
     while not stop_flag["stop"]:
         account_balances = {}  # 存储所有交易账户的余额信息（用于自动平衡）
         account_summaries = {}  # 存储账户摘要（包含 equity, available_balance, maintenance_margin）
         account_main_ids = {}  # 存储所有账户的主账户ID
-        all_accounts_normal = True  # 标记是否所有账户余额都正常
+        all_accounts_normal = True  # 标记是否所有交易账户余额都正常
+        funding_accounts_normal = True  # 标记资金账户查询是否正常
         
         # 分别查询交易账户和资金账户余额
         trading_account_balances = {}  # 只存储交易账户余额，用于自动平衡
@@ -2149,31 +2443,65 @@ def main() -> None:
                     # 查询交易账户余额
                     logging.debug("[%s] Calling aggregated_account_summary_v1 for trading account...", account_name)
                     try:
+                        # 确保认证（在调用 API 之前）
+                        client = ensure_authenticated(client, account_config, account_name, clients)
+                        
                         response = client.aggregated_account_summary_v1(EmptyRequest())
                         logging.debug("[%s] Response received: type=%s", account_name, type(response).__name__)
                         
                         if isinstance(response, GrvtError):
                             error_msg = getattr(response, 'message', '') or ''
-                            logging.error("[%s] API error fetching trading balance: code=%s status=%s message=%s", 
-                                        account_name, response.code, response.status, error_msg)
+                            error_code = getattr(response, 'code', '')
                             
-                            # 根据错误类型给出更明确的提示
-                            error_msg_lower = error_msg.lower()
-                            # code=1000 且包含 "authenticate" 时，通常是 IP 白名单问题（登录返回 text/plain）
-                            if response.code == 1008 or 'whitelist' in error_msg_lower or 'ip' in error_msg_lower or (response.code == 1000 and 'authenticate' in error_msg_lower):
-                                logging.error("[%s] (调试) 当前 API key: %s", account_config.name, account_config.api_key)
-                                logging.error("[%s] ⚠️  IP 地址未在白名单中！", account_name)
-                                logging.error("[%s] 请在 GRVT 网页端（Settings > API Keys）为 API key 添加当前 IP 地址到白名单。", account_name)
-                                logging.error("[%s] 查看当前 IP：https://api.ipify.org", account_name)
-                                logging.error("[%s] 或者移除 IP 白名单限制（如果允许）。", account_name)
-                            elif response.code == 1000:
-                                logging.error("[%s] Authentication failed. Please check:", account_name)
-                                logging.error("  1. IP address is whitelisted (most common issue)")
-                                logging.error("  2. API key is correct and matches the account ID")
-                                logging.error("  3. API key has 'View' or 'Trade' permission")
-                                logging.error("  4. Account type (trading/funding) matches the API key type")
+                            # 如果是认证错误（401 或 code=1000 且包含 authenticate），尝试重新认证并重试
+                            if (response.status == 401 or 
+                                (error_code == 1000 and 'authenticate' in error_msg.lower())):
+                                logging.warning("[%s] 遇到认证错误，尝试重新认证后重试: code=%s status=%s", 
+                                             account_name, error_code, response.status)
+                                try:
+                                    new_client = reauthenticate_client(account_config, account_name)
+                                    clients[account_name]["client"] = new_client
+                                    # 重试一次
+                                    response = new_client.aggregated_account_summary_v1(EmptyRequest())
+                                    if isinstance(response, GrvtError):
+                                        # 重试后仍然失败
+                                        error_msg = getattr(response, 'message', '') or ''
+                                        error_code = getattr(response, 'code', '')
+                                        logging.error("[%s] API error fetching trading balance after re-auth: code=%s status=%s message=%s", 
+                                                    account_name, error_code, response.status, error_msg)
+                                        all_accounts_normal = False
+                                    else:
+                                        # 重试成功，继续处理
+                                        logging.info("[%s] 重新认证后重试成功", account_name)
+                                except Exception as reauth_exc:
+                                    logging.error("[%s] 重新认证失败: %s", account_name, reauth_exc)
+                                    all_accounts_normal = False
+                                    continue
                             
-                            all_accounts_normal = False
+                            if isinstance(response, GrvtError):
+                                # 处理其他错误
+                                error_msg = getattr(response, 'message', '') or ''
+                                error_code = getattr(response, 'code', '')
+                                logging.error("[%s] API error fetching trading balance: code=%s status=%s message=%s", 
+                                            account_name, error_code, response.status, error_msg)
+                                
+                                # 根据错误类型给出更明确的提示
+                                error_msg_lower = error_msg.lower()
+                                # code=1000 且包含 "authenticate" 时，通常是 IP 白名单问题（登录返回 text/plain）
+                                if error_code == 1008 or 'whitelist' in error_msg_lower or 'ip' in error_msg_lower:
+                                    logging.error("[%s] ⚠️  IP 地址未在白名单中！", account_name)
+                                    logging.error("[%s] 请在 GRVT 网页端（Settings > API Keys）为 API key 添加当前 IP 地址到白名单。", account_name)
+                                    logging.error("[%s] 查看当前 IP：https://api.ipify.org", account_name)
+                                    logging.error("[%s] 或者移除 IP 白名单限制（如果允许）。", account_name)
+                                elif error_code == 1000:
+                                    logging.error("[%s] Authentication failed. Please check:", account_name)
+                                    logging.error("  1. IP address is whitelisted (most common issue)")
+                                    logging.error("  2. API key is correct and matches the account ID")
+                                    logging.error("  3. API key has 'View' or 'Trade' permission")
+                                    logging.error("  4. Account type (trading/funding) matches the API key type")
+                                
+                                all_accounts_normal = False
+                                continue
                         else:
                             total_equity_str = response.result.total_equity
                             main_account_id = response.result.main_account_id
@@ -2183,7 +2511,9 @@ def main() -> None:
                                        response.result.spot_balances, account_config.threshold)
                             
                             # 获取账户摘要（用于安全约束检查）
-                            summary = get_account_summary(client)
+                            # 更新客户端引用（可能已被重新认证）
+                            client = clients[account_name]["client"]
+                            summary = get_account_summary(client, account_config, account_name, clients)
                             if summary:
                                 account_summaries[account_name] = summary
                                 logging.debug("[%s] Account summary retrieved: equity=%.2f, available=%.2f, mm=%.2f",
@@ -2234,28 +2564,65 @@ def main() -> None:
                         logging.debug("[%s] Response received: type=%s", account_name, type(response).__name__)
                         
                         if isinstance(response, GrvtError):
+                            # Track consecutive failures
+                            if account_name not in funding_account_failures:
+                                funding_account_failures[account_name] = 0
+                            funding_account_failures[account_name] += 1
+                            failure_count = funding_account_failures[account_name]
+                            
                             error_msg = getattr(response, 'message', '') or ''
-                            logging.error("[%s] API error fetching funding balance: code=%s status=%s message=%s", 
-                                        account_name, response.code, response.status, error_msg)
-                            
-                            # 根据错误类型给出更明确的提示
                             error_msg_lower = error_msg.lower()
-                            # code=1000 且包含 "authenticate" 时，通常是 IP 白名单问题（登录返回 text/plain）
-                            if response.code == 1008 or 'whitelist' in error_msg_lower or 'ip' in error_msg_lower or (response.code == 1000 and 'authenticate' in error_msg_lower):
-                                logging.error("[%s] (调试) 当前 API key: %s", account_config.name, account_config.api_key)
-                                logging.error("[%s] ⚠️  IP 地址未在白名单中！", account_name)
-                                logging.error("[%s] 请在 GRVT 网页端（Settings > API Keys）为 API key 添加当前 IP 地址到白名单。", account_name)
-                                logging.error("[%s] 查看当前 IP：https://api.ipify.org", account_name)
-                                logging.error("[%s] 或者移除 IP 白名单限制（如果允许）。", account_name)
-                            elif response.code == 1000:
-                                logging.error("[%s] Authentication failed. Please check:", account_name)
-                                logging.error("  1. IP address is whitelisted (most common issue)")
-                                logging.error("  2. API key is correct and matches the funding account ID")
-                                logging.error("  3. API key has 'View' or 'Internal Transfer' permission")
-                                logging.error("  4. Account type is correctly set to 'funding'")
                             
-                            all_accounts_normal = False
+                            # After 3 consecutive failures, reduce log level to WARNING
+                            # Log summary every 10 failures instead of every failure
+                            log_level = logging.WARNING if failure_count >= 3 else logging.ERROR
+                            should_log_detail = (failure_count == 1) or (failure_count % 10 == 0)
+                            
+                            if should_log_detail:
+                                if log_level == logging.WARNING:
+                                    logging.warning("[%s] Funding account query failed (failure #%d): code=%s status=%s", 
+                                                  account_name, failure_count, response.code, response.status)
+                                else:
+                                    logging.error("[%s] API error fetching funding balance: code=%s status=%s message=%s", 
+                                                account_name, response.code, response.status, error_msg)
+                                
+                                # 根据错误类型给出更明确的提示（仅在详细日志时）
+                                # code=1000 且包含 "authenticate" 时，通常是 IP 白名单问题（登录返回 text/plain）
+                                if response.code == 1008 or 'whitelist' in error_msg_lower or 'ip' in error_msg_lower or (response.code == 1000 and 'authenticate' in error_msg_lower):
+                                    if log_level == logging.WARNING:
+                                        logging.warning("[%s] ⚠️  IP 地址未在白名单中！", account_name)
+                                        logging.warning("[%s] 请在 GRVT 网页端（Settings > API Keys）为 API key 添加当前 IP 地址到白名单。", account_name)
+                                        logging.warning("[%s] 查看当前 IP：https://api.ipify.org", account_name)
+                                        logging.warning("[%s] 或者移除 IP 白名单限制（如果允许）。", account_name)
+                                    else:
+                                        logging.error("[%s] ⚠️  IP 地址未在白名单中！", account_name)
+                                        logging.error("[%s] 请在 GRVT 网页端（Settings > API Keys）为 API key 添加当前 IP 地址到白名单。", account_name)
+                                        logging.error("[%s] 查看当前 IP：https://api.ipify.org", account_name)
+                                        logging.error("[%s] 或者移除 IP 白名单限制（如果允许）。", account_name)
+                                elif response.code == 1000:
+                                    if log_level == logging.WARNING:
+                                        logging.warning("[%s] Authentication failed. Please check:", account_name)
+                                        logging.warning("  1. IP address is whitelisted (most common issue)")
+                                        logging.warning("  2. API key is correct and matches the funding account ID")
+                                        logging.warning("  3. API key has 'View' or 'Internal Transfer' permission")
+                                        logging.warning("  4. Account type is correctly set to 'funding'")
+                                    else:
+                                        logging.error("[%s] Authentication failed. Please check:", account_name)
+                                        logging.error("  1. IP address is whitelisted (most common issue)")
+                                        logging.error("  2. API key is correct and matches the funding account ID")
+                                        logging.error("  3. API key has 'View' or 'Internal Transfer' permission")
+                                        logging.error("  4. Account type is correctly set to 'funding'")
+                            
+                            # 资金账户失败不阻塞自动平衡，但会影响每日汇总
+                            funding_accounts_normal = False
                         else:
+                            # Reset failure counter on success
+                            if account_name in funding_account_failures:
+                                if funding_account_failures[account_name] > 0:
+                                    logging.info("[%s] Funding account query recovered after %d failures", 
+                                               account_name, funding_account_failures[account_name])
+                                funding_account_failures[account_name] = 0
+                            
                             total_equity_str = response.result.total_equity
                             main_account_id = response.result.main_account_id
                             account_main_ids[account_name] = main_account_id
@@ -2269,9 +2636,27 @@ def main() -> None:
                             except ValueError:
                                 pass
                     except Exception as exc:
-                        logging.error("[%s] Exception during funding API call: %s", account_name, exc)
+                        # Track consecutive failures
+                        if account_name not in funding_account_failures:
+                            funding_account_failures[account_name] = 0
+                        funding_account_failures[account_name] += 1
+                        failure_count = funding_account_failures[account_name]
+                        
+                        # After 3 consecutive failures, reduce log level to WARNING
+                        # Log summary every 10 failures instead of every failure
+                        log_level = logging.WARNING if failure_count >= 3 else logging.ERROR
+                        should_log_detail = (failure_count == 1) or (failure_count % 10 == 0)
+                        
+                        if should_log_detail:
+                            if log_level == logging.WARNING:
+                                logging.warning("[%s] Exception during funding API call (failure #%d): %s", 
+                                              account_name, failure_count, exc)
+                            else:
+                                logging.error("[%s] Exception during funding API call: %s", account_name, exc)
                         logging.debug("[%s] Exception details: %s", account_name, exc, exc_info=True)
-                        all_accounts_normal = False
+                        
+                        # 资金账户失败不阻塞自动平衡，但会影响每日汇总
+                        funding_accounts_normal = False
             except Exception as exc:
                 logging.error("[%s] Error fetching balance: %s", account_name, exc)
                 all_accounts_normal = False
@@ -2284,157 +2669,208 @@ def main() -> None:
         logging.debug("[Auto-Balance] Found %d trading account(s): %s", len(trading_account_names), trading_account_names)
         logging.debug("[Auto-Balance] Account summaries available: %s", list(account_summaries.keys()))
         
-        if len(trading_account_names) == 2:
+        # Validate before auto-balance: ensure at least 2 trading accounts have valid balances
+        if len(trading_account_names) < 2:
+            logging.debug("[Auto-Balance] Skipping: need at least 2 trading accounts, found %d", len(trading_account_names))
+        elif len(trading_account_names) == 2:
             account1_name = trading_account_names[0]
             account2_name = trading_account_names[1]
             
-            logging.debug("[Auto-Balance] Checking balance between %s and %s", account1_name, account2_name)
+            # Validate balances are positive and reasonable
+            account1_balance = account_balances.get(account1_name, 0.0)
+            account2_balance = account_balances.get(account2_name, 0.0)
             
-            # 优先使用改进的再平衡逻辑（考虑安全约束）
-            transfer_info = None
-            if account1_name in account_summaries and account2_name in account_summaries:
-                logging.debug("[Auto-Balance] Using improved balance check with account summaries")
-                transfer_info = check_and_balance_accounts_improved(
-                    account1_name, account_summaries[account1_name],
-                    account2_name, account_summaries[account2_name],
-                    balance_threshold_percent, balance_target_percent
-                )
+            # Minimum balance threshold to prevent transfers when balances are too low
+            min_balance_threshold = 1.0  # Minimum 1 USDT to consider for auto-balance
+            
+            if account1_balance < 0 or account2_balance < 0:
+                logging.warning("[Auto-Balance] Skipping: invalid negative balances (%s=%.2f, %s=%.2f)", 
+                              account1_name, account1_balance, account2_name, account2_balance)
+            elif account1_balance < min_balance_threshold and account2_balance < min_balance_threshold:
+                logging.debug("[Auto-Balance] Skipping: both balances below minimum threshold (%.2f < %.2f)", 
+                            min(account1_balance, account2_balance), min_balance_threshold)
             else:
-                # 如果没有摘要信息，使用基础版本
-                missing_summaries = []
-                if account1_name not in account_summaries:
-                    missing_summaries.append(account1_name)
-                if account2_name not in account_summaries:
-                    missing_summaries.append(account2_name)
+                logging.debug("[Auto-Balance] Checking balance between %s and %s", account1_name, account2_name)
                 
-                logging.warning("[Auto-Balance] Account summaries not available for: %s, falling back to basic balance check",
-                              missing_summaries)
-                
-                account1_balance = account_balances[account1_name]
-                account2_balance = account_balances[account2_name]
-                
-                logging.debug("[Auto-Balance] Using basic balance check: %s=%.2f, %s=%.2f",
-                            account1_name, account1_balance, account2_name, account2_balance)
-                
-                transfer_info = check_and_balance_accounts(
-                    account1_name, account1_balance,
-                    account2_name, account2_balance,
-                    balance_threshold_percent, balance_target_percent
-                )
-            
-            if transfer_info:
-                # 检查是否在冷却期内（防止频繁转账，至少间隔30s冷却期）
-                transfer_key = f"{transfer_info['from_account']}_to_{transfer_info['to_account']}"
-                current_time = time.time()
-                if transfer_key in last_transfer_time:
-                    time_since_last = current_time - last_transfer_time[transfer_key]
-                    if time_since_last < 30:  # 30s冷却期
-                        logging.info("[Auto-Balance] Transfer skipped: cooling down (%.0f seconds remaining)", 30 - time_since_last)
+                # Check if account summaries are available if using improved balance check
+                # Validate account summaries have valid equity values if available
+                if account1_name in account_summaries and account2_name in account_summaries:
+                    account1_equity = account_summaries[account1_name].get("equity", 0.0)
+                    account2_equity = account_summaries[account2_name].get("equity", 0.0)
+                    if account1_equity < 0 or account2_equity < 0:
+                        logging.warning("[Auto-Balance] Skipping: invalid negative equity in summaries (%s=%.2f, %s=%.2f)", 
+                                      account1_name, account1_equity, account2_name, account2_equity)
                         transfer_info = None
+                    else:
+                        # 优先使用改进的再平衡逻辑（考虑安全约束）
+                        logging.debug("[Auto-Balance] Using improved balance check with account summaries")
+                        transfer_info = check_and_balance_accounts_improved(
+                            account1_name, account_summaries[account1_name],
+                            account2_name, account_summaries[account2_name],
+                            balance_threshold_percent, balance_target_percent
+                        )
+                else:
+                    # 如果没有摘要信息，使用基础版本
+                    missing_summaries = []
+                    if account1_name not in account_summaries:
+                        missing_summaries.append(account1_name)
+                    if account2_name not in account_summaries:
+                        missing_summaries.append(account2_name)
+                    
+                    logging.warning("[Auto-Balance] Account summaries not available for: %s, falling back to basic balance check",
+                                  missing_summaries)
+                    
+                    account1_balance = account_balances[account1_name]
+                    account2_balance = account_balances[account2_name]
+                    
+                    logging.debug("[Auto-Balance] Using basic balance check: %s=%.2f, %s=%.2f",
+                                account1_name, account1_balance, account2_name, account2_balance)
+                    
+                    transfer_info = check_and_balance_accounts(
+                        account1_name, account1_balance,
+                        account2_name, account2_balance,
+                        balance_threshold_percent, balance_target_percent
+                    )
                 
                 if transfer_info:
-                    from_account_name = transfer_info["from_account"]
-                    to_account_name = transfer_info["to_account"]
-                    transfer_amount = transfer_info["amount"]
-                    account1_percent = transfer_info.get("account1_percent", 0)
-                    account2_percent = transfer_info.get("account2_percent", 0)
+                    # 检查是否在冷却期内（防止频繁转账，至少间隔30s冷却期）
+                    transfer_key = f"{transfer_info['from_account']}_to_{transfer_info['to_account']}"
+                    current_time = time.time()
+                    if transfer_key in last_transfer_time:
+                        time_since_last = current_time - last_transfer_time[transfer_key]
+                        if time_since_last < 30:  # 30s冷却期
+                            logging.info("[Auto-Balance] Transfer skipped: cooling down (%.0f seconds remaining)", 30 - time_since_last)
+                            transfer_info = None
                     
-                    # 单条清晰的再平衡日志
-                    from_percent = account1_percent if from_account_name == account1_name else account2_percent
-                    to_percent = account1_percent if to_account_name == account1_name else account2_percent
-                    logging.info("[Auto-Balance] Rebalancing: Transferring %.2f USDT from %s to %s (%s: %.2f%%, %s: %.2f%%)",
-                                transfer_amount, from_account_name, to_account_name,
-                                from_account_name, from_percent, to_account_name, to_percent)
-                    
-                    from_config = clients[from_account_name]["config"]
-                    to_config = clients[to_account_name]["config"]
-                    
-                    # 获取主账户ID，如果不存在则使用配置中的关联主账户ID
-                    from_main_id = account_main_ids.get(from_account_name)
-                    if not from_main_id and from_config.related_main_account_id:
-                        from_main_id = from_config.related_main_account_id
-                        logging.warning("[Auto-Balance] Using configured main account ID for %s", from_account_name)
-                    
-                    to_main_id = account_main_ids.get(to_account_name)
-                    if not to_main_id and to_config.related_main_account_id:
-                        to_main_id = to_config.related_main_account_id
-                        logging.warning("[Auto-Balance] Using configured main account ID for %s", to_account_name)
-                    
-                    if not from_main_id or not to_main_id:
-                        logging.error("[Auto-Balance] Missing main account ID for transfer (from: %s, to: %s)",
-                                    from_account_name, to_account_name)
-                        continue
-                    
-                    # 尝试使用通过 funding 账户中转的转账路径（更安全）
-                    # 查找关联的资金账户配置
-                    from_funding_config = None
-                    to_funding_config = None
-                    
-                    if from_config.related_funding_account_id:
-                        # related_funding_account_id 应该是地址（funding_address），不是ID
-                        for name, data in clients.items():
-                            if (data["config"].account_type == "funding" and 
-                                data["config"].funding_address == from_config.related_funding_account_id):
-                                from_funding_config = data["config"]
-                                break
-                    
-                    if to_config.related_funding_account_id:
-                        # related_funding_account_id 应该是地址（funding_address），不是ID
-                        for name, data in clients.items():
-                            if (data["config"].account_type == "funding" and 
-                                data["config"].funding_address == to_config.related_funding_account_id):
-                                to_funding_config = data["config"]
-                                break
-                    
-                    # 强制要求配置资金账户，因为trading账户没有直接转账到另一个trading账户的权限
-                    # 正确的转账流程：A-trading → A-funding → B-funding → B-trading
-                    if not from_funding_config:
-                        logging.error("[Auto-Balance] ❌ 无法执行转账：源账户 %s 的资金账户未配置", from_account_name)
-                        logging.error("[Auto-Balance] 请在 .env 文件中配置 GRVT_RELATED_FUNDING_ACCOUNT_ID_*（注意：这个值应该是资金账户的地址，即 GRVT_FUNDING_ACCOUNT_ADDRESS_* 的值，不是ID）")
-                        logging.error("[Auto-Balance] 例如：如果资金账户地址是 0x1234...，则 GRVT_RELATED_FUNDING_ACCOUNT_ID_1=0x1234...")
-                        logging.error("[Auto-Balance] Trading账户的API key只有内部划转到funding账户的权限，必须通过资金账户中转")
-                        continue
-                    
-                    if not to_funding_config:
-                        logging.error("[Auto-Balance] ❌ 无法执行转账：目标账户 %s 的资金账户未配置", to_account_name)
-                        logging.error("[Auto-Balance] 请在 .env 文件中配置 GRVT_RELATED_FUNDING_ACCOUNT_ID_*（注意：这个值应该是资金账户的地址，即 GRVT_FUNDING_ACCOUNT_ADDRESS_* 的值，不是ID）")
-                        logging.error("[Auto-Balance] 例如：如果资金账户地址是 0x1234...，则 GRVT_RELATED_FUNDING_ACCOUNT_ID_1=0x1234...")
-                        logging.error("[Auto-Balance] Trading账户的API key只有内部划转到funding账户的权限，必须通过资金账户中转")
-                        continue
-                    
-                    if not from_funding_config.private_key:
-                        logging.error("[Auto-Balance] ❌ 无法执行转账：源账户 %s 的资金账户私钥未配置", from_account_name)
-                        logging.error("[Auto-Balance] 请在 .env 文件中配置对应的 GRVT_FUNDING_PRIVATE_KEY")
-                        continue
-                    
-                    if not to_funding_config.private_key:
-                        logging.error("[Auto-Balance] ❌ 无法执行转账：目标账户 %s 的资金账户私钥未配置", to_account_name)
-                        logging.error("[Auto-Balance] 请在 .env 文件中配置对应的 GRVT_FUNDING_PRIVATE_KEY")
-                        continue
-                    
-                    if not to_funding_config.funding_address:
-                        logging.error("[Auto-Balance] ❌ 无法执行转账：目标账户 %s 的资金账户地址未配置", to_account_name)
-                        logging.error("[Auto-Balance] 请在 .env 文件中配置对应的 GRVT_FUNDING_ACCOUNT_ADDRESS（以太坊地址）")
-                        logging.error("[Auto-Balance] 该地址必须在GRVT的Address Book中预先登记")
-                        continue
-                    
-                    # 使用通过 funding 账户中转的转账路径（必需）
-                    # Using transfer via funding accounts (required path)
-                    success = transfer_between_trading_accounts_via_funding(
-                        from_config, from_funding_config,
-                        to_funding_config, to_config,
-                        from_main_id, to_main_id,
-                        transfer_amount, "USDT"
-                    )
-                    
-                    if success:
-                        last_transfer_time[transfer_key] = current_time
-                        logging.info("[Auto-Balance] Transfer completed successfully")
-                    else:
-                        logging.error("[Auto-Balance] Transfer failed")
+                    if transfer_info:
+                        from_account_name = transfer_info["from_account"]
+                        to_account_name = transfer_info["to_account"]
+                        transfer_amount = transfer_info["amount"]
+                        account1_percent = transfer_info.get("account1_percent", 0)
+                        account2_percent = transfer_info.get("account2_percent", 0)
+                        
+                        # Pre-transfer validation
+                        from_balance = account_balances.get(from_account_name, 0.0)
+                        to_balance = account_balances.get(to_account_name, 0.0)
+                        
+                        # Verify both accounts have valid balances
+                        if from_account_name not in account_balances or to_account_name not in account_balances:
+                            logging.error("[Auto-Balance] Transfer aborted: missing balance data (from: %s, to: %s)",
+                                        from_account_name, to_account_name)
+                            continue
+                        
+                        # Check transfer amount is positive and reasonable
+                        if transfer_amount <= 0:
+                            logging.error("[Auto-Balance] Transfer aborted: invalid transfer amount %.2f", transfer_amount)
+                            continue
+                        
+                        if transfer_amount > 1000000:  # Sanity check: prevent unreasonably large transfers
+                            logging.error("[Auto-Balance] Transfer aborted: transfer amount too large %.2f (max: 1000000)", transfer_amount)
+                            continue
+                        
+                        # Ensure source account has sufficient balance
+                        if from_balance < transfer_amount:
+                            logging.error("[Auto-Balance] Transfer aborted: insufficient balance (%.2f < %.2f)",
+                                        from_balance, transfer_amount)
+                            continue
+                        
+                        # Validate main account IDs are available
+                        from_config = clients[from_account_name]["config"]
+                        to_config = clients[to_account_name]["config"]
+                        
+                        # 获取主账户ID，如果不存在则使用配置中的关联主账户ID
+                        from_main_id = account_main_ids.get(from_account_name)
+                        if not from_main_id and from_config.related_main_account_id:
+                            from_main_id = from_config.related_main_account_id
+                            logging.warning("[Auto-Balance] Using configured main account ID for %s", from_account_name)
+                        
+                        to_main_id = account_main_ids.get(to_account_name)
+                        if not to_main_id and to_config.related_main_account_id:
+                            to_main_id = to_config.related_main_account_id
+                            logging.warning("[Auto-Balance] Using configured main account ID for %s", to_account_name)
+                        
+                        if not from_main_id or not to_main_id:
+                            logging.error("[Auto-Balance] Missing main account ID for transfer (from: %s, to: %s)",
+                                        from_account_name, to_account_name)
+                            continue
+                        
+                        # 单条清晰的再平衡日志
+                        from_percent = account1_percent if from_account_name == account1_name else account2_percent
+                        to_percent = account1_percent if to_account_name == account1_name else account2_percent
+                        logging.info("[Auto-Balance] Rebalancing: Transferring %.2f USDT from %s to %s (%s: %.2f%%, %s: %.2f%%)",
+                                    transfer_amount, from_account_name, to_account_name,
+                                    from_account_name, from_percent, to_account_name, to_percent)
+                        
+                        # 尝试使用通过 funding 账户中转的转账路径（更安全）
+                        # 查找关联的资金账户配置
+                        from_funding_config = None
+                        to_funding_config = None
+                        
+                        if from_config.related_funding_account_id:
+                            # related_funding_account_id 应该是地址（funding_address），不是ID
+                            for name, data in clients.items():
+                                if (data["config"].account_type == "funding" and 
+                                    data["config"].funding_address == from_config.related_funding_account_id):
+                                    from_funding_config = data["config"]
+                                    break
+                        
+                        if to_config.related_funding_account_id:
+                            # related_funding_account_id 应该是地址（funding_address），不是ID
+                            for name, data in clients.items():
+                                if (data["config"].account_type == "funding" and 
+                                    data["config"].funding_address == to_config.related_funding_account_id):
+                                    to_funding_config = data["config"]
+                                    break
+                        
+                        # 强制要求配置资金账户，因为trading账户没有直接转账到另一个trading账户的权限
+                        # 正确的转账流程：A-trading → A-funding → B-funding → B-trading
+                        if not from_funding_config:
+                            logging.error("[Auto-Balance] ❌ 无法执行转账：源账户 %s 的资金账户未配置", from_account_name)
+                            logging.error("[Auto-Balance] 请在 .env 文件中配置 GRVT_RELATED_FUNDING_ACCOUNT_ID_*（注意：这个值应该是资金账户的地址，即 GRVT_FUNDING_ACCOUNT_ADDRESS_* 的值，不是ID）")
+                            logging.error("[Auto-Balance] 例如：如果资金账户地址是 0x1234...，则 GRVT_RELATED_FUNDING_ACCOUNT_ID_1=0x1234...")
+                            logging.error("[Auto-Balance] Trading账户的API key只有内部划转到funding账户的权限，必须通过资金账户中转")
+                            continue
+                        
+                        if not to_funding_config:
+                            logging.error("[Auto-Balance] ❌ 无法执行转账：目标账户 %s 的资金账户未配置", to_account_name)
+                            logging.error("[Auto-Balance] 请在 .env 文件中配置 GRVT_RELATED_FUNDING_ACCOUNT_ID_*（注意：这个值应该是资金账户的地址，即 GRVT_FUNDING_ACCOUNT_ADDRESS_* 的值，不是ID）")
+                            logging.error("[Auto-Balance] 例如：如果资金账户地址是 0x1234...，则 GRVT_RELATED_FUNDING_ACCOUNT_ID_1=0x1234...")
+                            logging.error("[Auto-Balance] Trading账户的API key只有内部划转到funding账户的权限，必须通过资金账户中转")
+                            continue
+                        
+                        if not from_funding_config.private_key:
+                            logging.error("[Auto-Balance] ❌ 无法执行转账：源账户 %s 的资金账户私钥未配置", from_account_name)
+                            logging.error("[Auto-Balance] 请在 .env 文件中配置对应的 GRVT_FUNDING_PRIVATE_KEY")
+                            continue
+                        
+                        if not to_funding_config.private_key:
+                            logging.error("[Auto-Balance] ❌ 无法执行转账：目标账户 %s 的资金账户私钥未配置", to_account_name)
+                            logging.error("[Auto-Balance] 请在 .env 文件中配置对应的 GRVT_FUNDING_PRIVATE_KEY")
+                            continue
+                        
+                        if not to_funding_config.funding_address:
+                            logging.error("[Auto-Balance] ❌ 无法执行转账：目标账户 %s 的资金账户地址未配置", to_account_name)
+                            logging.error("[Auto-Balance] 请在 .env 文件中配置对应的 GRVT_FUNDING_ACCOUNT_ADDRESS（以太坊地址）")
+                            logging.error("[Auto-Balance] 该地址必须在GRVT的Address Book中预先登记")
+                            continue
+                        
+                        # 使用通过 funding 账户中转的转账路径（必需）
+                        # Using transfer via funding accounts (required path)
+                        success = transfer_between_trading_accounts_via_funding(
+                            from_config, from_funding_config,
+                            to_funding_config, to_config,
+                            from_main_id, to_main_id,
+                            transfer_amount, "USDT"
+                        )
+                        
+                        if success:
+                            last_transfer_time[transfer_key] = current_time
+                            logging.info("[Auto-Balance] Transfer completed successfully")
+                        else:
+                            logging.error("[Auto-Balance] Transfer failed")
         
         # 检查是否需要发送每日汇总（余额正常时）
-        if all_accounts_normal and account_balances:
+        if all_accounts_normal and funding_accounts_normal and account_balances:
             beijing_now = datetime.now(BEIJING_TZ)
             current_date = beijing_now.date()
             
@@ -2442,6 +2878,21 @@ def main() -> None:
             if should_send_daily_summary() and last_summary_date != current_date:
                 send_daily_summary(account_balances)
                 last_summary_date = current_date
+
+        # 每 2 小时通过 Telegram 发送两个交易账户的总余额（北京时间 0 点开始）
+        if should_send_telegram_total_balance():
+            trading_names = [name for name in account_balances.keys()
+                             if clients[name]["config"].account_type == "trading"]
+            if len(trading_names) == 2:
+                total_balance = account_balances[trading_names[0]] + account_balances[trading_names[1]]
+                beijing_now = datetime.now(BEIJING_TZ)
+                message = (
+                    f"GRVT 两账号总余额: {total_balance:.2f} USDT\n"
+                    f"{trading_names[0]}: {account_balances[trading_names[0]]:.2f} USDT\n"
+                    f"{trading_names[1]}: {account_balances[trading_names[1]]:.2f} USDT\n"
+                    f"时间: {beijing_now.strftime('%Y-%m-%d %H:%M')} (北京时间)"
+                )
+                send_telegram_message(message)
         
         time.sleep(poll_interval)
 
