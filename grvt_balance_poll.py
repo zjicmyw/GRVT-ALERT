@@ -99,6 +99,32 @@ def send_telegram_message(message: str) -> None:
         return
 
 
+def send_telegram_message_with_cooldown(message: str, cooldown_sec: int = TELEGRAM_ERROR_COOLDOWN_SEC) -> None:
+    """发送 Telegram 消息并做冷却去重"""
+    try:
+        now = time.time()
+        last_sent = _last_telegram_error_time.get(message, 0.0)
+        if now - last_sent < cooldown_sec:
+            return
+        send_telegram_message(message)
+        _last_telegram_error_time[message] = now
+    except Exception:
+        return
+
+
+def send_signature_mismatch_telegram(account_name: str, main_account_id: str, account_id: str) -> None:
+    """签名不匹配时发送包含 main_account_id 与 account_id 的 Telegram"""
+    if not main_account_id or not account_id:
+        return
+    message = (
+        "签名不匹配（Signature does not match payload）\n"
+        f"account: {account_name}\n"
+        f"main_account_id: {main_account_id}\n"
+        f"account_id: {account_id}"
+    )
+    send_telegram_message_with_cooldown(message, cooldown_sec=24 * 60 * 60)
+
+
 def should_send_telegram_total_balance() -> bool:
     """北京时间 0 点起每 2 小时发送一次"""
     try:
@@ -113,6 +139,16 @@ def should_send_telegram_total_balance() -> bool:
             return False
         _last_telegram_total_balance_hour = current_key
         return True
+    except Exception:
+        return False
+
+
+def is_signature_mismatch(error_code: Any, error_msg: str) -> bool:
+    """判断是否为签名不匹配错误"""
+    try:
+        code_str = str(error_code) if error_code is not None else ""
+        msg_lower = (error_msg or "").lower()
+        return code_str == "2002" or ("signature" in msg_lower and "match" in msg_lower)
     except Exception:
         return False
 
@@ -193,10 +229,8 @@ def build_client(account_config: AccountConfig) -> GrvtRawSync:
                 # 检查是否是 IP 白名单问题
                 # 注意：code=1000 且登录返回 text/plain 时，通常是 IP 白名单问题
                 if error_code == 1008 or 'whitelist' in error_msg.lower() or 'ip' in error_msg.lower() or (error_code == 1000 and 'authenticate' in error_msg.lower()):
-                    logging.error("[%s] ⚠️  IP 地址未在白名单中！", account_config.name)
-                    logging.error("[%s] 请在 GRVT 网页端（Settings > API Keys）为 API key 添加当前 IP 地址到白名单。", account_config.name)
-                    logging.error("[%s] 查看当前 IP：https://api.ipify.org", account_config.name)
-                    logging.error("[%s] 或者移除 IP 白名单限制（如果允许）。", account_config.name)
+                    logging.error("[%s] ⚠️ IP 白名单问题：请在 GRVT 网页端（Settings > API Keys）为 API key 添加当前 IP（https://api.ipify.org），或移除白名单限制（如允许）。", account_config.name)
+                  
                 
                 # 不抛出异常，让主循环处理
             else:
@@ -213,10 +247,7 @@ def build_client(account_config: AccountConfig) -> GrvtRawSync:
                 # 检查是否是 IP 白名单问题
                 # 注意：code=1000 且登录返回 text/plain 时，通常是 IP 白名单问题
                 if error_code == 1008 or 'whitelist' in error_msg.lower() or 'ip' in error_msg.lower() or (error_code == 1000 and 'authenticate' in error_msg.lower()):
-                    logging.error("[%s] ⚠️  IP 地址未在白名单中！", account_config.name)
-                    logging.error("[%s] 请在 GRVT 网页端（Settings > API Keys）为 API key 添加当前 IP 地址到白名单。", account_config.name)
-                    logging.error("[%s] 查看当前 IP：https://api.ipify.org", account_config.name)
-                    logging.error("[%s] 或者移除 IP 白名单限制（如果允许）。", account_config.name)
+                    logging.error("[%s] ⚠️ IP 白名单问题：请在 GRVT 网页端（Settings > API Keys）为 API key 添加当前 IP（https://api.ipify.org），或移除白名单限制（如允许）。", account_config.name)
                 
                 # 不抛出异常，让主循环处理
             else:
@@ -229,8 +260,7 @@ def build_client(account_config: AccountConfig) -> GrvtRawSync:
         
         # 检查异常消息中是否包含 IP 白名单相关信息
         if 'whitelist' in error_msg.lower() or 'IP' in error_msg:
-            logging.error("[%s] ⚠️  可能是 IP 地址未在白名单中的问题！", account_config.name)
-            logging.error("[%s] 请在 GRVT 网页端（Settings > API Keys）为 API key 添加当前 IP 地址到白名单。", account_config.name)
+            logging.error("[%s] ⚠️ 可能是 IP 白名单问题：请在 GRVT 网页端（Settings > API Keys）为 API key 添加当前 IP（https://api.ipify.org）。", account_config.name)
     
     return client
 
@@ -1448,12 +1478,14 @@ def transfer_between_trading_accounts(
                         from_config.name, error_code, error_status, error_msg)
             # 根据错误类型给出更明确的提示
             error_msg_lower = error_msg.lower()
+            # 优先检查签名错误
+            if is_signature_mismatch(error_code, error_msg):
+                logging.error("[%s] 签名不匹配（Signature does not match payload），请检查 private key / main_account_id / account_id 是否对应", from_config.name)
+                send_signature_mismatch_telegram(from_config.name, from_main_account_id, from_trading_account_id)
             # 检查权限错误：code=1001 或 status=403 或消息中包含 permission/unauthorized
-            if (error_code == 1001 or error_status == 403 or 
-                'permission' in error_msg_lower or 'unauthorized' in error_msg_lower or 'not authorized' in error_msg_lower):
-                logging.error("[%s] ⚠️  API key 没有转账权限！", from_config.name)
-                logging.error("[%s] 请检查该账户的 API key 权限与账户类型/ID 是否匹配", from_config.name)
-                logging.error("[%s] 请在 GRVT 网页端（Settings > API Keys）检查并更新此 API key 的权限（需要 Transfer 权限）。", from_config.name)
+            elif (error_code == 1001 or error_status == 403 or 
+                  'permission' in error_msg_lower or 'unauthorized' in error_msg_lower or 'not authorized' in error_msg_lower):
+                logging.error("[%s] ⚠️ API key 没有转账权限，请检查权限与账户类型/ID 是否匹配，并在 GRVT 网页端（Settings > API Keys）授予 Transfer 权限。", from_config.name)
             elif 'insufficient' in error_msg_lower or 'balance' in error_msg_lower:
                 logging.error("[%s] Insufficient balance for transfer. Please check account balance.",
                             from_config.name)
@@ -1468,8 +1500,7 @@ def transfer_between_trading_accounts(
         logging.error("[%s] Error transferring: %s", from_config.name, error_msg)
         # 检查是否是 API key 相关错误
         if 'api' in error_msg.lower() or 'key' in error_msg.lower() or 'permission' in error_msg.lower():
-            logging.error("[%s] ⚠️  可能是 API key 问题！", from_config.name)
-            logging.error("[%s] 请检查该账户的 API key 权限与账户类型是否匹配", from_config.name)
+            logging.error("[%s] ⚠️ 可能是 API key 问题，请检查权限与账户类型是否匹配。", from_config.name)
         return False
 
 
@@ -1594,12 +1625,14 @@ def transfer_trading_to_funding(
                         trading_config.name, error_code, error_status, error_msg)
             # 根据错误类型给出更明确的提示
             error_msg_lower = error_msg.lower() if error_msg else ""
+            # 优先检查签名错误
+            if is_signature_mismatch(error_code, error_msg):
+                logging.error("[%s] 签名不匹配（Signature does not match payload），请检查 private key / main_account_id / account_id 是否对应", trading_config.name)
+                send_signature_mismatch_telegram(trading_config.name, main_account_id, trading_account_id)
             # 检查权限错误：code=1001 或 status=403 或消息中包含 permission/unauthorized
-            if (error_code == 1001 or error_status == 403 or 
-                'permission' in error_msg_lower or 'unauthorized' in error_msg_lower or 'not authorized' in error_msg_lower):
-                logging.error("[%s] ⚠️  API key 没有转账权限！", trading_config.name)
-                logging.error("[%s] 请检查该账户的 API key 权限与账户类型/ID 是否匹配", trading_config.name)
-                logging.error("[%s] 请在 GRVT 网页端（Settings > API Keys）检查并更新此 API key 的权限（需要 Internal Transfer 权限，从 Trading 到 Funding）。", trading_config.name)
+            elif (error_code == 1001 or error_status == 403 or 
+                  'permission' in error_msg_lower or 'unauthorized' in error_msg_lower or 'not authorized' in error_msg_lower):
+                logging.error("[%s] ⚠️ API key 没有转账权限，请检查权限与账户类型/ID 是否匹配，并在 GRVT 网页端（Settings > API Keys）授予 Internal Transfer 权限（Trading→Funding）。", trading_config.name)
             elif 'insufficient' in error_msg_lower or 'balance' in error_msg_lower:
                 logging.error("[%s] Insufficient balance for transfer. Please check account balance.",
                             trading_config.name)
@@ -1618,8 +1651,7 @@ def transfer_trading_to_funding(
         logging.error("[%s] Error transferring to funding account: %s", trading_config.name, error_msg)
         # 检查是否是 API key 相关错误
         if 'api' in error_msg.lower() or 'key' in error_msg.lower() or 'permission' in error_msg.lower():
-            logging.error("[%s] ⚠️  可能是 API key 问题！", trading_config.name)
-            logging.error("[%s] 请检查该账户的 API key 权限与账户类型是否匹配", trading_config.name)
+            logging.error("[%s] ⚠️ 可能是 API key 问题，请检查权限与账户类型是否匹配。", trading_config.name)
         return False, {"success": False, "error": {"exception": error_msg}, "message": error_msg}
 
 
@@ -1734,15 +1766,16 @@ def transfer_funding_to_trading(
                         funding_config.name, error_code, error_status, error_msg)
             # 根据错误类型给出更明确的提示
             error_msg_lower = error_msg.lower() if error_msg else ""
-            if 'insufficient' in error_msg_lower or 'balance' in error_msg_lower:
+            if is_signature_mismatch(error_code, error_msg):
+                logging.error("[%s] 签名不匹配（Signature does not match payload），请检查 private key / main_account_id / account_id 是否对应", funding_config.name)
+                send_signature_mismatch_telegram(funding_config.name, main_account_id, funding_config.account_id)
+            elif 'insufficient' in error_msg_lower or 'balance' in error_msg_lower:
                 logging.error("[%s] Insufficient balance for transfer. Please check funding account balance.",
                             funding_config.name)
             # 检查权限错误：code=1001 或 status=403 或消息中包含 permission/unauthorized
             elif (error_code == 1001 or error_status == 403 or 
                   'permission' in error_msg_lower or 'unauthorized' in error_msg_lower or 'not authorized' in error_msg_lower):
-                logging.error("[%s] ⚠️  API key 没有转账权限！", funding_config.name)
-                logging.error("[%s] 请检查该账户的 API key 权限与账户类型/ID 是否匹配", funding_config.name)
-                logging.error("[%s] 请在 GRVT 网页端（Settings > API Keys）检查并更新此 API key 的权限（需要 Internal Transfer 权限，从 Funding 到 Trading）。", funding_config.name)
+                logging.error("[%s] ⚠️ API key 没有转账权限，请检查权限与账户类型/ID 是否匹配，并在 GRVT 网页端（Settings > API Keys）授予 Internal Transfer 权限（Funding→Trading）。", funding_config.name)
             return False, tx_info
         
         tx_id = tx_info.get("tx_id")
@@ -1754,8 +1787,7 @@ def transfer_funding_to_trading(
         logging.error("[%s] Error transferring from funding account: %s", funding_config.name, error_msg)
         # 检查是否是 API key 相关错误
         if 'api' in error_msg.lower() or 'key' in error_msg.lower() or 'permission' in error_msg.lower():
-            logging.error("[%s] ⚠️  可能是 API key 问题！", funding_config.name)
-            logging.error("[%s] 请检查该账户的 API key 权限与账户类型是否匹配", funding_config.name)
+            logging.error("[%s] ⚠️ 可能是 API key 问题，请检查权限与账户类型是否匹配。", funding_config.name)
         return False, {"success": False, "error": {"exception": error_msg}, "message": error_msg}
 
 
@@ -1848,11 +1880,8 @@ def transfer_between_trading_accounts_via_funding(
         )
         
         if not step1_success:
-            logging.error("[Transfer] Step 1/3 failed: trading → funding")
             logging.error("[Transfer] ⚠️  这需要使用 %s 的 trading 账户 API key，需要 Internal Transfer 权限（从 Trading 到 Funding）", from_trading_config.name)
-            logging.error("[Transfer] 请检查该账户的 API key 权限与账户类型/ID 是否匹配")
-            logging.error("[Transfer] 请在 GRVT 网页端（Settings > API Keys）检查并更新此 API key 的权限")
-            
+      
             # 记录失败信息（仅在 DEBUG 模式下记录完整日志）
             if logging.getLogger().isEnabledFor(logging.DEBUG):
                 transfer_log = {
@@ -1924,11 +1953,8 @@ def transfer_between_trading_accounts_via_funding(
         )
         
         if not step2_success:
-            logging.error("[Transfer] Step 2/3 failed: funding → funding (external)")
-            logging.error("[Transfer] ⚠️  这需要使用 %s 的 funding 账户 API key，需要 External Transfer 权限", from_funding_config.name)
-            logging.error("[Transfer] 请检查该账户的 API key 权限与账户类型/ID 是否匹配")
-            logging.error("[Transfer] 请在 GRVT 网页端（Settings > API Keys）检查并更新此 API key 的权限（需要 External Transfer 权限）")
-            logging.error("[Transfer] 注意：目标地址 %s 必须在 Address Book 中预先登记", to_funding_config.funding_address)
+            logging.error("[Transfer] Step 2/3 failed: funding → funding (external). Requires %s funding API key with External Transfer permission; check API key account type/ID; target address %s must be in Address Book; update in Settings > API Keys.", 
+                          from_funding_config.name, to_funding_config.funding_address)
             # 如果失败，尝试回滚：A-funding → A-trading
             logging.warning("[Transfer] Attempting rollback: funding → trading")
             rollback_success, _ = transfer_funding_to_trading(
@@ -1968,10 +1994,8 @@ def transfer_between_trading_accounts_via_funding(
         )
         
         if not step3_success:
-            logging.error("[Transfer] Step 3/3 failed: funding → trading")
-            logging.error("[Transfer] ⚠️  这需要使用 %s 的 funding 账户 API key，需要 Internal Transfer 权限", to_funding_config.name)
-            logging.error("[Transfer] 请检查该账户的 API key 权限与账户类型/ID 是否匹配")
-            logging.error("[Transfer] 请在 GRVT 网页端（Settings > API Keys）检查并更新此 API key 的权限（需要 Internal Transfer 权限，从 Funding 到 Trading）")
+            logging.error("[Transfer] Step 3/3 failed: funding → trading. Requires %s funding API key with Internal Transfer permission (Funding→Trading); check API key account type/ID; update in Settings > API Keys.", 
+                          to_funding_config.name)
             # 如果失败，资金已经在 B-funding，记录错误但前两步已成功
             logging.warning("[Transfer] Funds are in %s funding account, manual intervention may be needed",
                           to_funding_config.name)
@@ -2228,25 +2252,24 @@ def transfer_funding_to_funding(
             error_msg = tx_info.get("message", "")
             error_dict = tx_info.get("error", {})
             
-            # 输出详细的错误信息
-            logging.error("[%s] External transfer from funding account failed", from_funding_config.name)
-            logging.error("[%s] Error details: code=%s, status=%s, message=%s", 
-                        from_funding_config.name, error_code, error_status, error_msg)
-            if error_dict:
-                logging.error("[%s] Full error dict: %s", from_funding_config.name, json.dumps(error_dict, default=str))
-            logging.error("[%s] Full tx_info: %s", from_funding_config.name, json.dumps(tx_info, default=str))
+            # 输出详细的错误信息（单行）
+            logging.error("[%s] External transfer failed: code=%s status=%s message=%s error=%s tx_info=%s",
+                        from_funding_config.name, error_code, error_status, error_msg,
+                        json.dumps(error_dict, default=str) if error_dict else "{}",
+                        json.dumps(tx_info, default=str))
             
             # 根据错误类型给出更明确的提示
             error_msg_lower = error_msg.lower() if error_msg else ""
-            if any(keyword in error_msg_lower for keyword in ['address', 'address book', 'whitelist', 'not found', 'invalid']):
+            if is_signature_mismatch(error_code, error_msg):
+                logging.error("[%s] 签名不匹配（Signature does not match payload），请检查 private key / main_account_id / account_id 是否对应", from_funding_config.name)
+                send_signature_mismatch_telegram(from_funding_config.name, from_main_account_id, from_funding_config.account_id)
+            elif any(keyword in error_msg_lower for keyword in ['address', 'address book', 'whitelist', 'not found', 'invalid']):
                 logging.error("[%s] Target address %s may not be in Address Book. Please add it in GRVT web interface (Settings > Address Book).",
                             from_funding_config.name, to_funding_address)
             # 检查权限错误：code=1001 或 status=403 或消息中包含 permission/unauthorized
             elif (error_code == 1001 or error_status == 403 or 
                   'permission' in error_msg_lower or 'unauthorized' in error_msg_lower or 'not authorized' in error_msg_lower):
-                logging.error("[%s] ⚠️  API key 没有外部转账权限！", from_funding_config.name)
-                logging.error("[%s] 请检查该账户的 API key 权限与账户类型/ID 是否匹配", from_funding_config.name)
-                logging.error("[%s] 请在 GRVT 网页端（Settings > API Keys）检查并更新此 API key 的权限（需要 External Transfer 权限）。", from_funding_config.name)
+                logging.error("[%s] ⚠️ API key 没有外部转账权限，请检查权限与账户类型/ID 是否匹配，并在 GRVT 网页端（Settings > API Keys）授予 External Transfer 权限。", from_funding_config.name)
             elif 'insufficient' in error_msg_lower or 'balance' in error_msg_lower:
                 logging.error("[%s] Insufficient balance for transfer. Please check funding account balance.",
                             from_funding_config.name)
@@ -2267,8 +2290,7 @@ def transfer_funding_to_funding(
                      from_funding_config.name, error_msg)
         # 检查是否是 API key 相关错误
         if 'api' in error_msg.lower() or 'key' in error_msg.lower() or 'permission' in error_msg.lower():
-            logging.error("[%s] ⚠️  可能是 API key 问题！", from_funding_config.name)
-            logging.error("[%s] 请检查该账户的 API key 权限与账户类型是否匹配", from_funding_config.name)
+            logging.error("[%s] ⚠️ 可能是 API key 问题，请检查权限与账户类型是否匹配。", from_funding_config.name)
         return False, {"success": False, "error": {"exception": error_msg}, "message": error_msg}
 
 
@@ -2489,16 +2511,9 @@ def main() -> None:
                                 error_msg_lower = error_msg.lower()
                                 # code=1000 且包含 "authenticate" 时，通常是 IP 白名单问题（登录返回 text/plain）
                                 if error_code == 1008 or 'whitelist' in error_msg_lower or 'ip' in error_msg_lower:
-                                    logging.error("[%s] ⚠️  IP 地址未在白名单中！", account_name)
-                                    logging.error("[%s] 请在 GRVT 网页端（Settings > API Keys）为 API key 添加当前 IP 地址到白名单。", account_name)
-                                    logging.error("[%s] 查看当前 IP：https://api.ipify.org", account_name)
-                                    logging.error("[%s] 或者移除 IP 白名单限制（如果允许）。", account_name)
+                                    logging.error("[%s] ⚠️ IP 白名单问题：请在 GRVT 网页端（Settings > API Keys）为 API key 添加当前 IP（https://api.ipify.org），或移除白名单限制（如允许）。", account_name)
                                 elif error_code == 1000:
-                                    logging.error("[%s] Authentication failed. Please check:", account_name)
-                                    logging.error("  1. IP address is whitelisted (most common issue)")
-                                    logging.error("  2. API key is correct and matches the account ID")
-                                    logging.error("  3. API key has 'View' or 'Trade' permission")
-                                    logging.error("  4. Account type (trading/funding) matches the API key type")
+                                    logging.error("[%s] Authentication failed: check IP whitelist, API key matches account ID, API key has View/Trade permission, account type matches.", account_name)
                                 
                                 all_accounts_normal = False
                                 continue
@@ -2595,10 +2610,7 @@ def main() -> None:
                                         logging.warning("[%s] 查看当前 IP：https://api.ipify.org", account_name)
                                         logging.warning("[%s] 或者移除 IP 白名单限制（如果允许）。", account_name)
                                     else:
-                                        logging.error("[%s] ⚠️  IP 地址未在白名单中！", account_name)
-                                        logging.error("[%s] 请在 GRVT 网页端（Settings > API Keys）为 API key 添加当前 IP 地址到白名单。", account_name)
-                                        logging.error("[%s] 查看当前 IP：https://api.ipify.org", account_name)
-                                        logging.error("[%s] 或者移除 IP 白名单限制（如果允许）。", account_name)
+                                        logging.error("[%s] ⚠️ IP 白名单问题：请在 GRVT 网页端（Settings > API Keys）为 API key 添加当前 IP（https://api.ipify.org），或移除白名单限制（如允许）。", account_name)
                                 elif response.code == 1000:
                                     if log_level == logging.WARNING:
                                         logging.warning("[%s] Authentication failed. Please check:", account_name)
@@ -2607,11 +2619,7 @@ def main() -> None:
                                         logging.warning("  3. API key has 'View' or 'Internal Transfer' permission")
                                         logging.warning("  4. Account type is correctly set to 'funding'")
                                     else:
-                                        logging.error("[%s] Authentication failed. Please check:", account_name)
-                                        logging.error("  1. IP address is whitelisted (most common issue)")
-                                        logging.error("  2. API key is correct and matches the funding account ID")
-                                        logging.error("  3. API key has 'View' or 'Internal Transfer' permission")
-                                        logging.error("  4. Account type is correctly set to 'funding'")
+                                        logging.error("[%s] Authentication failed: check IP whitelist, API key matches funding account ID, API key has View/Internal Transfer permission, account type is funding.", account_name)
                             
                             # 资金账户失败不阻塞自动平衡，但会影响每日汇总
                             funding_accounts_normal = False
@@ -2825,33 +2833,23 @@ def main() -> None:
                         # 强制要求配置资金账户，因为trading账户没有直接转账到另一个trading账户的权限
                         # 正确的转账流程：A-trading → A-funding → B-funding → B-trading
                         if not from_funding_config:
-                            logging.error("[Auto-Balance] ❌ 无法执行转账：源账户 %s 的资金账户未配置", from_account_name)
-                            logging.error("[Auto-Balance] 请在 .env 文件中配置 GRVT_RELATED_FUNDING_ACCOUNT_ID_*（注意：这个值应该是资金账户的地址，即 GRVT_FUNDING_ACCOUNT_ADDRESS_* 的值，不是ID）")
-                            logging.error("[Auto-Balance] 例如：如果资金账户地址是 0x1234...，则 GRVT_RELATED_FUNDING_ACCOUNT_ID_1=0x1234...")
-                            logging.error("[Auto-Balance] Trading账户的API key只有内部划转到funding账户的权限，必须通过资金账户中转")
+                            logging.error("[Auto-Balance] ❌ 无法执行转账：源账户 %s 的资金账户未配置，请在 .env 配置 GRVT_RELATED_FUNDING_ACCOUNT_ID_*（应为资金账户地址，与 GRVT_FUNDING_ACCOUNT_ADDRESS_* 一致，非ID；例如 0x1234...），trading 需通过 funding 中转", from_account_name)
                             continue
                         
                         if not to_funding_config:
-                            logging.error("[Auto-Balance] ❌ 无法执行转账：目标账户 %s 的资金账户未配置", to_account_name)
-                            logging.error("[Auto-Balance] 请在 .env 文件中配置 GRVT_RELATED_FUNDING_ACCOUNT_ID_*（注意：这个值应该是资金账户的地址，即 GRVT_FUNDING_ACCOUNT_ADDRESS_* 的值，不是ID）")
-                            logging.error("[Auto-Balance] 例如：如果资金账户地址是 0x1234...，则 GRVT_RELATED_FUNDING_ACCOUNT_ID_1=0x1234...")
-                            logging.error("[Auto-Balance] Trading账户的API key只有内部划转到funding账户的权限，必须通过资金账户中转")
+                            logging.error("[Auto-Balance] ❌ 无法执行转账：目标账户 %s 的资金账户未配置，请在 .env 配置 GRVT_RELATED_FUNDING_ACCOUNT_ID_*（应为资金账户地址，与 GRVT_FUNDING_ACCOUNT_ADDRESS_* 一致，非ID；例如 0x1234...），trading 需通过 funding 中转", to_account_name)
                             continue
                         
                         if not from_funding_config.private_key:
-                            logging.error("[Auto-Balance] ❌ 无法执行转账：源账户 %s 的资金账户私钥未配置", from_account_name)
-                            logging.error("[Auto-Balance] 请在 .env 文件中配置对应的 GRVT_FUNDING_PRIVATE_KEY")
+                            logging.error("[Auto-Balance] ❌ 无法执行转账：源账户 %s 的资金账户私钥未配置，请在 .env 配置对应的 GRVT_FUNDING_PRIVATE_KEY", from_account_name)
                             continue
                         
                         if not to_funding_config.private_key:
-                            logging.error("[Auto-Balance] ❌ 无法执行转账：目标账户 %s 的资金账户私钥未配置", to_account_name)
-                            logging.error("[Auto-Balance] 请在 .env 文件中配置对应的 GRVT_FUNDING_PRIVATE_KEY")
+                            logging.error("[Auto-Balance] ❌ 无法执行转账：目标账户 %s 的资金账户私钥未配置，请在 .env 配置对应的 GRVT_FUNDING_PRIVATE_KEY", to_account_name)
                             continue
                         
                         if not to_funding_config.funding_address:
-                            logging.error("[Auto-Balance] ❌ 无法执行转账：目标账户 %s 的资金账户地址未配置", to_account_name)
-                            logging.error("[Auto-Balance] 请在 .env 文件中配置对应的 GRVT_FUNDING_ACCOUNT_ADDRESS（以太坊地址）")
-                            logging.error("[Auto-Balance] 该地址必须在GRVT的Address Book中预先登记")
+                            logging.error("[Auto-Balance] ❌ 无法执行转账：目标账户 %s 的资金账户地址未配置，请在 .env 配置 GRVT_FUNDING_ACCOUNT_ADDRESS（以太坊地址，需在 Address Book 预先登记）", to_account_name)
                             continue
                         
                         # 使用通过 funding 账户中转的转账路径（必需）
