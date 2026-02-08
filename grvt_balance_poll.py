@@ -8,6 +8,7 @@ import signal
 import sys
 import time
 import io
+from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -45,6 +46,8 @@ TELEGRAM_LOCAL_ENDPOINT = "http://localhost:3000/send-message"
 
 # 每 2 小时发送一次两账号总余额（北京时间 0 点开始）
 _last_telegram_total_balance_hour: str | None = None
+USDT_DECIMALS = 6
+USDT_QUANTIZER = Decimal("0.000001")
 
 
 class TelegramErrorHandler(logging.Handler):
@@ -151,6 +154,53 @@ def is_signature_mismatch(error_code: Any, error_msg: str) -> bool:
         return code_str == "2002" or ("signature" in msg_lower and "match" in msg_lower)
     except Exception:
         return False
+
+
+def normalize_account_id(account_id: str | None) -> str:
+    """规范化账户ID/地址，避免大小写或空白导致的签名载荷不一致。"""
+    value = (account_id or "").strip()
+    if value.lower().startswith("0x"):
+        return value.lower()
+    return value
+
+
+def normalize_transfer_amount(amount: float, currency: str = "USDT") -> Tuple[float, str]:
+    """将转账金额规范化为稳定字符串，避免 float 抖动导致签名偶发不一致。"""
+    try:
+        dec_amount = Decimal(str(amount))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError(f"Invalid transfer amount: {amount}") from exc
+
+    # 当前流程主要用于 USDT（6 位精度）
+    if currency.upper() == "USDT":
+        normalized = dec_amount.quantize(USDT_QUANTIZER, rounding=ROUND_DOWN)
+        return float(normalized), format(normalized, f".{USDT_DECIMALS}f")
+
+    # 非 USDT 情况保持兼容：不做进制转换，仅输出非科学计数法字符串
+    normalized = dec_amount.quantize(USDT_QUANTIZER, rounding=ROUND_DOWN)
+    return float(normalized), format(normalized, "f")
+
+
+def classify_transfer_error(tx_info: Dict[str, Any]) -> str:
+    """归类转账错误，避免误把签名/余额问题提示成权限问题。"""
+    error_code = tx_info.get("code")
+    error_status = tx_info.get("status")
+    error_msg = tx_info.get("message", "") or ""
+    error_msg_lower = error_msg.lower()
+
+    if is_signature_mismatch(error_code, error_msg):
+        return "signature_mismatch"
+    if "insufficient" in error_msg_lower or "balance" in error_msg_lower:
+        return "insufficient_balance"
+    if (
+        error_code == 1001
+        or error_status == 403
+        or "permission" in error_msg_lower
+        or "unauthorized" in error_msg_lower
+        or "not authorized" in error_msg_lower
+    ):
+        return "permission"
+    return "other"
 
 
 @dataclass
@@ -395,7 +445,7 @@ def load_account_configs() -> List[AccountConfig]:
         # 向后兼容：如果没有配置 GRVT_RELATED_FUNDING_ACCOUNT_ID_X，尝试使用同索引的 funding_address
         if not related_funding_account_id:
             related_funding_account_id = funding_address
-        related_main_account_id = os.getenv(f"GRVT_RELATED_MAIN_ACCOUNT_ID_{index}")
+        related_main_account_id = normalize_account_id(os.getenv(f"GRVT_RELATED_MAIN_ACCOUNT_ID_{index}"))
         env = os.getenv(f"GRVT_ENV_{index}", os.getenv("GRVT_ENV", "prod"))
         threshold_str = os.getenv(f"GRVT_THRESHOLD_{index}")
         
@@ -872,8 +922,10 @@ def calculate_safe_transfer_amount(
     
     if safe_amount < 0:
         return 0.0
-    
-    return safe_amount
+
+    # 统一到 USDT 6 位精度，避免后续签名/请求金额在 float 表示上抖动
+    normalized_amount, _ = normalize_transfer_amount(safe_amount, "USDT")
+    return normalized_amount
 
 
 def sweep_funding_to_trading(
@@ -1527,28 +1579,35 @@ def transfer_trading_to_funding(
         currency: 币种，默认USDT
     """
     try:
+        raw_amount = amount
+
         # 验证转账金额
         if amount <= 0:
             logging.error("[%s] Transfer amount must be positive, got: %.2f", trading_config.name, amount)
             return False, {"success": False, "error": "Invalid amount", "amount": amount}
-        
+
         # 验证主账户ID
         if not main_account_id:
             logging.error("[%s] Main account ID is required for transfer", trading_config.name)
             return False, {"success": False, "error": "Missing main account ID"}
-        
+
         # 验证账户类型
         if trading_config.account_type != "trading":
             logging.error("[%s] Config must be a trading account config", trading_config.name)
             return False, {"success": False, "error": "Invalid account type", "account_type": trading_config.account_type}
-        
+
         if not trading_config.private_key:
             logging.error("[%s] Private key not configured, cannot transfer", trading_config.name)
             return False, {"success": False, "error": "Private key not configured"}
-        
+
+        # 规范化载荷字段，避免大小写/空白差异导致偶发签名不匹配
+        main_account_id = normalize_account_id(main_account_id)
+        trading_account_id = normalize_account_id(trading_account_id)
+        amount, amount_str = normalize_transfer_amount(amount, currency)
+
         # 使用交易账户的客户端
         client = build_client(trading_config)
-        
+
         # 验证可转余额；不足时告警，但继续尝试转账（由 API 最终判定）
         if not verify_transfer_balance(client, amount, currency, trading_config, trading_config.name):
             summary = get_account_summary(client, trading_config, trading_config.name)
@@ -1558,25 +1617,27 @@ def transfer_trading_to_funding(
             send_insufficient_transfer_balance_alert(
                 trading_config.name, available, amount, "Trading→Funding", currency
             )
-        
+
         account = Account.from_key(trading_config.private_key)
-        
+
         # 根据 grvt-transfer 参考代码，内部转账（trading → funding）时，
         # to_sub_account_id 应该使用 "0"，而不是 funding_account_id
         # 参考：req_a_internal = TransferService.build_req(..., a_funding_addr, "0", ...)
         expiration_ns = str(int(time.time_ns() + 15 * 60 * 1_000_000_000))
         nonce = random.randint(1, 2**31 - 1)
-        
-        logging.debug("[%s] Building transfer request: from_account_id=%s, from_sub_account_id=%s, to_account_id=%s, to_sub_account_id=%s, amount=%s, expiration=%s, nonce=%s",
-                     trading_config.name, main_account_id, trading_account_id, main_account_id, "0", amount, expiration_ns, nonce)
-        
+
+        logging.debug(
+            "[%s] Building transfer request: from_account_id=%s, from_sub_account_id=%s, to_account_id=%s, to_sub_account_id=%s, raw_amount=%s, normalized_amount=%s, expiration=%s, nonce=%s",
+            trading_config.name, main_account_id, trading_account_id, main_account_id, "0", raw_amount, amount_str, expiration_ns, nonce
+        )
+
         transfer = Transfer(
             from_account_id=main_account_id,
             from_sub_account_id=trading_account_id,
             to_account_id=main_account_id,
             to_sub_account_id="0",  # 内部转账到funding账户时，使用"0"而不是funding_account_id
             currency=currency,
-            num_tokens=str(amount),
+            num_tokens=amount_str,
             signature=Signature(
                 signer="",
                 r="0x",
@@ -1591,14 +1652,14 @@ def transfer_trading_to_funding(
         
         grvt_config = GrvtApiConfig(
             env=GrvtEnv(trading_config.env.lower()),
-            trading_account_id=trading_config.account_id,
+            trading_account_id=normalize_account_id(trading_config.account_id),
             private_key=trading_config.private_key,
             api_key=trading_config.api_key,
             logger=logging.getLogger(f"grvt_transfer_{trading_config.name}"),
         )
-        
+
         signed_transfer = sign_transfer(transfer, grvt_config, account)
-        
+
         from pysdk.grvt_raw_types import ApiTransferRequest
         transfer_request = ApiTransferRequest(
             from_account_id=signed_transfer.from_account_id,
@@ -1611,12 +1672,12 @@ def transfer_trading_to_funding(
             transfer_type=signed_transfer.transfer_type,
             transfer_metadata=signed_transfer.transfer_metadata
         )
-        
+
         # 使用重试机制执行转账
         success, tx_info = try_transfer_with_retry(
             client, transfer_request, retries=2, backoff_ms=1500, account_name=trading_config.name
         )
-        
+
         if not success:
             error_code = tx_info.get("code")
             error_status = tx_info.get("status")
@@ -1624,16 +1685,15 @@ def transfer_trading_to_funding(
             logging.error("[%s] Transfer to funding account failed: code=%s status=%s message=%s", 
                         trading_config.name, error_code, error_status, error_msg)
             # 根据错误类型给出更明确的提示
-            error_msg_lower = error_msg.lower() if error_msg else ""
             # 优先检查签名错误
-            if is_signature_mismatch(error_code, error_msg):
+            category = classify_transfer_error(tx_info)
+            if category == "signature_mismatch":
                 logging.error("[%s] 签名不匹配（Signature does not match payload），请检查 private key / main_account_id / account_id 是否对应", trading_config.name)
                 send_signature_mismatch_telegram(trading_config.name, main_account_id, trading_account_id)
             # 检查权限错误：code=1001 或 status=403 或消息中包含 permission/unauthorized
-            elif (error_code == 1001 or error_status == 403 or 
-                  'permission' in error_msg_lower or 'unauthorized' in error_msg_lower or 'not authorized' in error_msg_lower):
+            elif category == "permission":
                 logging.error("[%s] ⚠️ API key 没有转账权限，请检查权限与账户类型/ID 是否匹配，并在 GRVT 网页端（Settings > API Keys）授予 Internal Transfer 权限（Trading→Funding）。", trading_config.name)
-            elif 'insufficient' in error_msg_lower or 'balance' in error_msg_lower:
+            elif category == "insufficient_balance":
                 logging.error("[%s] Insufficient balance for transfer. Please check account balance.",
                             trading_config.name)
                 # API 返回余额不足时也发送告警（与转账前校验不足告警一致）
@@ -1641,11 +1701,11 @@ def transfer_trading_to_funding(
                     trading_config.name, 0.0, amount, "Trading→Funding", currency
                 )
             return False, tx_info
-        
+
         tx_id = tx_info.get("tx_id")
         # Success log removed - will be logged at TransferFlow level
         return True, tx_info
-        
+
     except Exception as exc:
         error_msg = str(exc)
         logging.error("[%s] Error transferring to funding account: %s", trading_config.name, error_msg)
@@ -1678,46 +1738,54 @@ def transfer_funding_to_trading(
         currency: 币种，默认USDT
     """
     try:
+        raw_amount = amount
+
         # 验证转账金额
         if amount <= 0:
             logging.error("[%s] Transfer amount must be positive, got: %.2f", funding_config.name, amount)
             return False, {"success": False, "error": "Invalid amount", "amount": amount}
-        
+
         # 验证主账户ID
         if not main_account_id:
             logging.error("[%s] Main account ID is required for transfer", funding_config.name)
             return False, {"success": False, "error": "Missing main account ID"}
-        
+
         # 验证账户类型
         if funding_config.account_type != "funding":
             logging.error("[%s] Config must be a funding account config", funding_config.name)
             return False, {"success": False, "error": "Invalid account type", "account_type": funding_config.account_type}
-        
+
         if not funding_config.private_key:
             logging.error("[%s] Private key not configured, cannot transfer", funding_config.name)
             return False, {"success": False, "error": "Private key not configured"}
-        
+
+        main_account_id = normalize_account_id(main_account_id)
+        trading_account_id = normalize_account_id(trading_account_id)
+        amount, amount_str = normalize_transfer_amount(amount, currency)
+
         # 使用资金账户的客户端
         client = build_client(funding_config)
-        
+
         account = Account.from_key(funding_config.private_key)
-        
+
         # 根据 grvt-transfer 参考代码，内部转账（funding → trading）时，
         # from_sub_account_id 应该使用 "0"，而不是 funding_account_id
         # 参考：req_b_deposit = TransferService.build_req(..., b_funding_addr, "0", b_funding_addr, b_trading_sub, ...)
         expiration_ns = str(int(time.time_ns() + 15 * 60 * 1_000_000_000))
         nonce = random.randint(1, 2**31 - 1)
-        
-        logging.debug("[%s] Building transfer request: from_account_id=%s, from_sub_account_id=%s, to_account_id=%s, to_sub_account_id=%s, amount=%s, expiration=%s, nonce=%s",
-                     funding_config.name, main_account_id, "0", main_account_id, trading_account_id, amount, expiration_ns, nonce)
-        
+
+        logging.debug(
+            "[%s] Building transfer request: from_account_id=%s, from_sub_account_id=%s, to_account_id=%s, to_sub_account_id=%s, raw_amount=%s, normalized_amount=%s, expiration=%s, nonce=%s",
+            funding_config.name, main_account_id, "0", main_account_id, trading_account_id, raw_amount, amount_str, expiration_ns, nonce
+        )
+
         transfer = Transfer(
             from_account_id=main_account_id,
             from_sub_account_id="0",  # 内部转账从funding账户转出时，使用"0"而不是funding_account_id
             to_account_id=main_account_id,
             to_sub_account_id=trading_account_id,
             currency=currency,
-            num_tokens=str(amount),
+            num_tokens=amount_str,
             signature=Signature(
                 signer="",
                 r="0x",
@@ -1732,14 +1800,14 @@ def transfer_funding_to_trading(
         
         grvt_config = GrvtApiConfig(
             env=GrvtEnv(funding_config.env.lower()),
-            trading_account_id=funding_config.account_id,
+            trading_account_id=normalize_account_id(funding_config.account_id),
             private_key=funding_config.private_key,
             api_key=funding_config.api_key,
             logger=logging.getLogger(f"grvt_transfer_{funding_config.name}"),
         )
-        
+
         signed_transfer = sign_transfer(transfer, grvt_config, account)
-        
+
         from pysdk.grvt_raw_types import ApiTransferRequest
         transfer_request = ApiTransferRequest(
             from_account_id=signed_transfer.from_account_id,
@@ -1752,12 +1820,12 @@ def transfer_funding_to_trading(
             transfer_type=signed_transfer.transfer_type,
             transfer_metadata=signed_transfer.transfer_metadata
         )
-        
+
         # 使用重试机制执行转账
         success, tx_info = try_transfer_with_retry(
             client, transfer_request, retries=2, backoff_ms=1500, account_name=funding_config.name
         )
-        
+
         if not success:
             error_code = tx_info.get("code")
             error_status = tx_info.get("status")
@@ -1765,23 +1833,22 @@ def transfer_funding_to_trading(
             logging.error("[%s] Transfer from funding account failed: code=%s status=%s message=%s", 
                         funding_config.name, error_code, error_status, error_msg)
             # 根据错误类型给出更明确的提示
-            error_msg_lower = error_msg.lower() if error_msg else ""
-            if is_signature_mismatch(error_code, error_msg):
+            category = classify_transfer_error(tx_info)
+            if category == "signature_mismatch":
                 logging.error("[%s] 签名不匹配（Signature does not match payload），请检查 private key / main_account_id / account_id 是否对应", funding_config.name)
                 send_signature_mismatch_telegram(funding_config.name, main_account_id, funding_config.account_id)
-            elif 'insufficient' in error_msg_lower or 'balance' in error_msg_lower:
+            elif category == "insufficient_balance":
                 logging.error("[%s] Insufficient balance for transfer. Please check funding account balance.",
                             funding_config.name)
             # 检查权限错误：code=1001 或 status=403 或消息中包含 permission/unauthorized
-            elif (error_code == 1001 or error_status == 403 or 
-                  'permission' in error_msg_lower or 'unauthorized' in error_msg_lower or 'not authorized' in error_msg_lower):
+            elif category == "permission":
                 logging.error("[%s] ⚠️ API key 没有转账权限，请检查权限与账户类型/ID 是否匹配，并在 GRVT 网页端（Settings > API Keys）授予 Internal Transfer 权限（Funding→Trading）。", funding_config.name)
             return False, tx_info
-        
+
         tx_id = tx_info.get("tx_id")
         # Success log removed - will be logged at TransferFlow level
         return True, tx_info
-        
+
     except Exception as exc:
         error_msg = str(exc)
         logging.error("[%s] Error transferring from funding account: %s", funding_config.name, error_msg)
@@ -1856,7 +1923,12 @@ def transfer_between_trading_accounts_via_funding(
         if not to_funding_config.private_key:
             logging.error("[Transfer] Target funding account private key not configured")
             return False
-        
+
+        # 统一规范化参数，避免步骤间金额/ID 形态不一致
+        from_main_account_id = normalize_account_id(from_main_account_id)
+        to_main_account_id = normalize_account_id(to_main_account_id)
+        amount, amount_str = normalize_transfer_amount(amount, currency)
+
         # 记录转账开始时间和转账前余额
         start_time = datetime.now(BEIJING_TZ).isoformat()
         from_trading_client = build_client(from_trading_config)
@@ -1878,21 +1950,30 @@ def transfer_between_trading_accounts_via_funding(
             from_trading_config.account_id,
             from_funding_config.account_id, amount, currency
         )
-        
+
         if not step1_success:
-            logging.error("[Transfer] ⚠️  这需要使用 %s 的 trading 账户 API key，需要 Internal Transfer 权限（从 Trading 到 Funding）", from_trading_config.name)
-      
+            step1_category = classify_transfer_error(step1_info)
+            if step1_category == "signature_mismatch":
+                logging.error("[Transfer] Step 1/3 failed: trading → funding (signature mismatch). Check private key/main_account_id/account_id mapping for %s.", from_trading_config.name)
+            elif step1_category == "permission":
+                logging.error("[Transfer] Step 1/3 failed: trading → funding. Requires %s trading API key with Internal Transfer permission (Trading→Funding); check API key account type/ID; update in Settings > API Keys.", from_trading_config.name)
+            elif step1_category == "insufficient_balance":
+                logging.error("[Transfer] Step 1/3 failed: trading → funding (insufficient balance).")
+            else:
+                logging.error("[Transfer] Step 1/3 failed: trading → funding. code=%s status=%s message=%s",
+                              step1_info.get("code"), step1_info.get("status"), step1_info.get("message"))
+
             # 记录失败信息（仅在 DEBUG 模式下记录完整日志）
             if logging.getLogger().isEnabledFor(logging.DEBUG):
                 transfer_log = {
                     "event_time": start_time,
                     "success": False,
-                    "transfer_usdt": str(amount),
+                    "transfer_usdt": amount_str,
                     "step": 1,
                     "step_name": "trading_to_funding",
                     "from_trading": from_trading_config.name,
                     "to_trading": to_trading_config.name,
-                    "error": step1_info.get("error", {}),
+                    "error": step1_info,
                     "tx_ids": {},
                     "balances_pre": {
                         "from_trading": from_trading_pre,
@@ -1932,7 +2013,7 @@ def transfer_between_trading_accounts_via_funding(
                 transfer_log = {
                     "event_time": start_time,
                     "success": False,
-                    "transfer_usdt": str(amount),
+                    "transfer_usdt": amount_str,
                     "step": 2,
                     "step_name": "funding_to_funding",
                     "error": "Target funding address not configured",
@@ -1969,10 +2050,10 @@ def transfer_between_trading_accounts_via_funding(
                 transfer_log = {
                     "event_time": start_time,
                     "success": False,
-                    "transfer_usdt": str(amount),
+                    "transfer_usdt": amount_str,
                     "step": 2,
                     "step_name": "funding_to_funding",
-                    "error": step2_info.get("error", {}),
+                    "error": step2_info,
                     "rollback_attempted": True,
                     "rollback_success": rollback_success,
                     "tx_ids": {"step1": step1_tx_id}
@@ -1992,10 +2073,18 @@ def transfer_between_trading_accounts_via_funding(
             to_funding_config.account_id,
             to_trading_config.account_id, amount, currency
         )
-        
+
         if not step3_success:
-            logging.error("[Transfer] Step 3/3 failed: funding → trading. Requires %s funding API key with Internal Transfer permission (Funding→Trading); check API key account type/ID; update in Settings > API Keys.", 
-                          to_funding_config.name)
+            step3_category = classify_transfer_error(step3_info)
+            if step3_category == "signature_mismatch":
+                logging.error("[Transfer] Step 3/3 failed: funding → trading (signature mismatch). Check private key/main_account_id/account_id mapping for %s.", to_funding_config.name)
+            elif step3_category == "permission":
+                logging.error("[Transfer] Step 3/3 failed: funding → trading. Requires %s funding API key with Internal Transfer permission (Funding→Trading); check API key account type/ID; update in Settings > API Keys.", to_funding_config.name)
+            elif step3_category == "insufficient_balance":
+                logging.error("[Transfer] Step 3/3 failed: funding → trading (insufficient balance).")
+            else:
+                logging.error("[Transfer] Step 3/3 failed: funding → trading. code=%s status=%s message=%s",
+                              step3_info.get("code"), step3_info.get("status"), step3_info.get("message"))
             # 如果失败，资金已经在 B-funding，记录错误但前两步已成功
             logging.warning("[Transfer] Funds are in %s funding account, manual intervention may be needed",
                           to_funding_config.name)
@@ -2010,10 +2099,10 @@ def transfer_between_trading_accounts_via_funding(
                 transfer_log = {
                     "event_time": start_time,
                     "success": False,
-                    "transfer_usdt": str(amount),
+                    "transfer_usdt": amount_str,
                     "step": 3,
                     "step_name": "funding_to_trading",
-                    "error": step3_info.get("error", {}),
+                    "error": step3_info,
                     "funds_location": f"{to_funding_config.name} funding account",
                     "tx_ids": {
                         "step1": step1_tx_id,
@@ -2050,7 +2139,7 @@ def transfer_between_trading_accounts_via_funding(
             transfer_log = {
                 "event_time": start_time,
                 "success": True,
-                "transfer_usdt": str(amount),
+                "transfer_usdt": amount_str,
                 "currency": currency,
                 "from_trading": from_trading_config.name,
                 "to_trading": to_trading_config.name,
@@ -2134,30 +2223,37 @@ def transfer_funding_to_funding(
         (是否成功, 详细信息字典)
     """
     try:
+        raw_amount = amount
+
         # 验证转账金额
         if amount <= 0:
             logging.error("[%s] Transfer amount must be positive, got: %.2f", from_funding_config.name, amount)
             return False, {"success": False, "error": "Invalid amount", "amount": amount}
-        
+
         # 验证主账户ID
         if not from_main_account_id:
             logging.error("[%s] Main account ID is required for transfer", from_funding_config.name)
             return False, {"success": False, "error": "Missing main account ID"}
-        
+
         # 验证账户类型
         if from_funding_config.account_type != "funding":
             logging.error("[%s] Config must be a funding account config", from_funding_config.name)
             return False, {"success": False, "error": "Invalid account type", "account_type": from_funding_config.account_type}
-        
+
         if not from_funding_config.private_key:
             logging.error("[%s] Private key not configured, cannot transfer", from_funding_config.name)
             return False, {"success": False, "error": "Private key not configured"}
-        
+
         # 验证 from_funding_config.funding_address 必须存在（外部转账必须使用以太坊地址）
         if not from_funding_config.funding_address:
             logging.error("[%s] funding_address is required for external transfer", from_funding_config.name)
             return False, {"success": False, "error": "Missing funding_address", "message": "funding_address is required for external transfer"}
-        
+
+        from_main_account_id = normalize_account_id(from_main_account_id)
+        to_funding_address = normalize_account_id(to_funding_address)
+        to_main_account_id = normalize_account_id(to_main_account_id) if to_main_account_id else None
+        amount, amount_str = normalize_transfer_amount(amount, currency)
+
         # 验证 from_funding_address 格式
         if not validate_ethereum_address(from_funding_config.funding_address):
             logging.error("[%s] Invalid from_funding_address format: %s (must be 0x followed by 40 hex characters)",
@@ -2177,9 +2273,9 @@ def transfer_funding_to_funding(
         if not verify_transfer_balance(client, amount, currency, from_funding_config, from_funding_config.name):
             logging.warning("[%s] Balance verification failed, but proceeding with transfer (API will reject if insufficient)",
                           from_funding_config.name)
-        
+
         account = Account.from_key(from_funding_config.private_key)
-        
+
         # 构建外部转账请求
         # 参考 grvt-transfer 仓库：req_ff = TransferService.build_req(..., a_funding_addr, "0", b_funding_addr, "0", ...)
         # 外部转账（funding → funding）时：
@@ -2194,10 +2290,15 @@ def transfer_funding_to_funding(
         # 根据参考代码，from_account_id 必须使用 funding_address（外部转账必须使用以太坊地址）
         # 不再回退到 from_main_account_id，因为外部转账必须使用地址格式
         from_account_id = from_funding_config.funding_address
-        
+
         expiration_ns = str(int(time.time_ns() + 15 * 60 * 1_000_000_000))
         nonce = random.randint(1, 2**31 - 1)
-        
+
+        logging.debug(
+            "[%s] Building external transfer request: from_account_id=%s, to_account_id=%s, raw_amount=%s, normalized_amount=%s, expiration=%s, nonce=%s",
+            from_funding_config.name, from_account_id, to_account_id, raw_amount, amount_str, expiration_ns, nonce
+        )
+
         # 确保所有参数都转换为字符串（参考实现使用 str() 转换所有参数）
         transfer = Transfer(
             from_account_id=str(from_account_id),  # 转出账户的 funding_address（根据参考代码，应该使用 funding_address）
@@ -2205,7 +2306,7 @@ def transfer_funding_to_funding(
             to_account_id=str(to_account_id),  # 外部转账：优先使用 to_main_account_id，否则使用 to_funding_address（根据API文档，应该是main account）
             to_sub_account_id=str("0"),  # 外部转账到funding账户时，使用"0"而不是目标地址
             currency=str(currency),
-            num_tokens=str(amount),
+            num_tokens=amount_str,
             signature=Signature(
                 signer="",
                 r="0x",
@@ -2220,7 +2321,7 @@ def transfer_funding_to_funding(
         
         grvt_config = GrvtApiConfig(
             env=GrvtEnv(from_funding_config.env.lower()),
-            trading_account_id=from_funding_config.account_id,
+            trading_account_id=normalize_account_id(from_funding_config.account_id),
             private_key=from_funding_config.private_key,
             api_key=from_funding_config.api_key,
             logger=logging.getLogger(f"grvt_transfer_{from_funding_config.name}"),
@@ -2260,17 +2361,17 @@ def transfer_funding_to_funding(
             
             # 根据错误类型给出更明确的提示
             error_msg_lower = error_msg.lower() if error_msg else ""
-            if is_signature_mismatch(error_code, error_msg):
+            category = classify_transfer_error(tx_info)
+            if category == "signature_mismatch":
                 logging.error("[%s] 签名不匹配（Signature does not match payload），请检查 private key / main_account_id / account_id 是否对应", from_funding_config.name)
                 send_signature_mismatch_telegram(from_funding_config.name, from_main_account_id, from_funding_config.account_id)
             elif any(keyword in error_msg_lower for keyword in ['address', 'address book', 'whitelist', 'not found', 'invalid']):
                 logging.error("[%s] Target address %s may not be in Address Book. Please add it in GRVT web interface (Settings > Address Book).",
                             from_funding_config.name, to_funding_address)
             # 检查权限错误：code=1001 或 status=403 或消息中包含 permission/unauthorized
-            elif (error_code == 1001 or error_status == 403 or 
-                  'permission' in error_msg_lower or 'unauthorized' in error_msg_lower or 'not authorized' in error_msg_lower):
+            elif category == "permission":
                 logging.error("[%s] ⚠️ API key 没有外部转账权限，请检查权限与账户类型/ID 是否匹配，并在 GRVT 网页端（Settings > API Keys）授予 External Transfer 权限。", from_funding_config.name)
-            elif 'insufficient' in error_msg_lower or 'balance' in error_msg_lower:
+            elif category == "insufficient_balance":
                 logging.error("[%s] Insufficient balance for transfer. Please check funding account balance.",
                             from_funding_config.name)
             elif 'account' in error_msg_lower and 'id' in error_msg_lower:
@@ -2519,7 +2620,7 @@ def main() -> None:
                                 continue
                         else:
                             total_equity_str = response.result.total_equity
-                            main_account_id = response.result.main_account_id
+                            main_account_id = normalize_account_id(response.result.main_account_id)
                             account_main_ids[account_name] = main_account_id
                             
                             log_balances(account_name, total_equity_str, 
@@ -2632,7 +2733,7 @@ def main() -> None:
                                 funding_account_failures[account_name] = 0
                             
                             total_equity_str = response.result.total_equity
-                            main_account_id = response.result.main_account_id
+                            main_account_id = normalize_account_id(response.result.main_account_id)
                             account_main_ids[account_name] = main_account_id
                             
                             logging.info("[%s] Funding Account Total Equity: %s", account_name, total_equity_str)
@@ -2789,12 +2890,12 @@ def main() -> None:
                         # 获取主账户ID，如果不存在则使用配置中的关联主账户ID
                         from_main_id = account_main_ids.get(from_account_name)
                         if not from_main_id and from_config.related_main_account_id:
-                            from_main_id = from_config.related_main_account_id
+                            from_main_id = normalize_account_id(from_config.related_main_account_id)
                             logging.warning("[Auto-Balance] Using configured main account ID for %s", from_account_name)
                         
                         to_main_id = account_main_ids.get(to_account_name)
                         if not to_main_id and to_config.related_main_account_id:
-                            to_main_id = to_config.related_main_account_id
+                            to_main_id = normalize_account_id(to_config.related_main_account_id)
                             logging.warning("[Auto-Balance] Using configured main account ID for %s", to_account_name)
                         
                         if not from_main_id or not to_main_id:
