@@ -156,6 +156,39 @@ def is_signature_mismatch(error_code: Any, error_msg: str) -> bool:
         return False
 
 
+def is_authentication_error(error_code: Any, error_status: Any, error_msg: str) -> bool:
+    """判断是否为认证失败（会话失效/未登录/API key 无效等）。"""
+    try:
+        code_str = str(error_code) if error_code is not None else ""
+        status_str = str(error_status) if error_status is not None else ""
+        msg_lower = (error_msg or "").lower()
+        return (
+            status_str == "401"
+            or code_str == "1000"
+            or "authenticate" in msg_lower
+            or "unauthorized" in msg_lower
+            or "not authorized" in msg_lower
+        )
+    except Exception:
+        return False
+
+
+def is_probable_ip_whitelist_error(error_code: Any, error_msg: str) -> bool:
+    """判断是否更像是 IP 白名单问题。注意：code=1000 不应直接等同白名单。"""
+    try:
+        code_str = str(error_code) if error_code is not None else ""
+        msg_lower = (error_msg or "").lower()
+        return (
+            code_str == "1008"
+            or "whitelist" in msg_lower
+            or "white list" in msg_lower
+            or ("ip" in msg_lower and "allow" in msg_lower)
+            or ("ip" in msg_lower and "whitelist" in msg_lower)
+        )
+    except Exception:
+        return False
+
+
 def normalize_account_id(account_id: str | None) -> str:
     """规范化账户ID/地址，避免大小写或空白导致的签名载荷不一致。"""
     value = (account_id or "").strip()
@@ -276,9 +309,8 @@ def build_client(account_config: AccountConfig) -> GrvtRawSync:
                 logging.warning("[%s] Authentication test failed: code=%s status=%s message=%s", 
                               account_config.name, error_code, test_response.status, error_msg)
                 
-                # 检查是否是 IP 白名单问题
-                # 注意：code=1000 且登录返回 text/plain 时，通常是 IP 白名单问题
-                if error_code == 1008 or 'whitelist' in error_msg.lower() or 'ip' in error_msg.lower() or (error_code == 1000 and 'authenticate' in error_msg.lower()):
+                # 仅在明确命中白名单特征时提示白名单，避免把普通 401 误报成白名单
+                if is_probable_ip_whitelist_error(error_code, error_msg):
                     logging.error("[%s] ⚠️ IP 白名单问题：请在 GRVT 网页端（Settings > API Keys）为 API key 添加当前 IP（https://api.ipify.org），或移除白名单限制（如允许）。", account_config.name)
                   
                 
@@ -294,9 +326,8 @@ def build_client(account_config: AccountConfig) -> GrvtRawSync:
                 logging.warning("[%s] Authentication test failed: code=%s status=%s message=%s", 
                               account_config.name, error_code, test_response.status, error_msg)
                 
-                # 检查是否是 IP 白名单问题
-                # 注意：code=1000 且登录返回 text/plain 时，通常是 IP 白名单问题
-                if error_code == 1008 or 'whitelist' in error_msg.lower() or 'ip' in error_msg.lower() or (error_code == 1000 and 'authenticate' in error_msg.lower()):
+                # 仅在明确命中白名单特征时提示白名单，避免把普通 401 误报成白名单
+                if is_probable_ip_whitelist_error(error_code, error_msg):
                     logging.error("[%s] ⚠️ IP 白名单问题：请在 GRVT 网页端（Settings > API Keys）为 API key 添加当前 IP（https://api.ipify.org），或移除白名单限制（如允许）。", account_config.name)
                 
                 # 不抛出异常，让主循环处理
@@ -309,7 +340,7 @@ def build_client(account_config: AccountConfig) -> GrvtRawSync:
                        account_config.name, error_msg)
         
         # 检查异常消息中是否包含 IP 白名单相关信息
-        if 'whitelist' in error_msg.lower() or 'IP' in error_msg:
+        if 'whitelist' in error_msg.lower() or ('ip' in error_msg.lower() and 'allow' in error_msg.lower()):
             logging.error("[%s] ⚠️ 可能是 IP 白名单问题：请在 GRVT 网页端（Settings > API Keys）为 API key 添加当前 IP（https://api.ipify.org）。", account_config.name)
     
     return client
@@ -2609,12 +2640,10 @@ def main() -> None:
                                             account_name, error_code, response.status, error_msg)
                                 
                                 # 根据错误类型给出更明确的提示
-                                error_msg_lower = error_msg.lower()
-                                # code=1000 且包含 "authenticate" 时，通常是 IP 白名单问题（登录返回 text/plain）
-                                if error_code == 1008 or 'whitelist' in error_msg_lower or 'ip' in error_msg_lower:
+                                if is_probable_ip_whitelist_error(error_code, error_msg):
                                     logging.error("[%s] ⚠️ IP 白名单问题：请在 GRVT 网页端（Settings > API Keys）为 API key 添加当前 IP（https://api.ipify.org），或移除白名单限制（如允许）。", account_name)
-                                elif error_code == 1000:
-                                    logging.error("[%s] Authentication failed: check IP whitelist, API key matches account ID, API key has View/Trade permission, account type matches.", account_name)
+                                elif is_authentication_error(error_code, response.status, error_msg):
+                                    logging.error("[%s] Authentication failed after retry: check API key/account ID/private key mapping, permission, account type; if persistent, verify IP whitelist.", account_name)
                                 
                                 all_accounts_normal = False
                                 continue
@@ -2676,9 +2705,28 @@ def main() -> None:
                     # 查询资金账户余额
                     logging.debug("[%s] Calling funding_account_summary_v1 for funding account...", account_name)
                     try:
+                        # 与 trading 分支一致：先确保认证，避免使用过期会话
+                        client = ensure_authenticated(client, account_config, account_name, clients)
+
                         response = client.funding_account_summary_v1(EmptyRequest())
                         logging.debug("[%s] Response received: type=%s", account_name, type(response).__name__)
-                        
+
+                        # 认证错误时先重认证并重试一次，成功则不计入失败次数
+                        if isinstance(response, GrvtError):
+                            error_msg = getattr(response, 'message', '') or ''
+                            error_code = getattr(response, 'code', '')
+                            if is_authentication_error(error_code, response.status, error_msg):
+                                logging.warning("[%s] 遇到认证错误，尝试重新认证后重试: code=%s status=%s", 
+                                             account_name, error_code, response.status)
+                                try:
+                                    new_client = reauthenticate_client(account_config, account_name)
+                                    clients[account_name]["client"] = new_client
+                                    response = new_client.funding_account_summary_v1(EmptyRequest())
+                                    if not isinstance(response, GrvtError):
+                                        logging.info("[%s] 重新认证后重试成功", account_name)
+                                except Exception as reauth_exc:
+                                    logging.error("[%s] 重新认证失败: %s", account_name, reauth_exc)
+
                         if isinstance(response, GrvtError):
                             # Track consecutive failures
                             if account_name not in funding_account_failures:
@@ -2687,7 +2735,6 @@ def main() -> None:
                             failure_count = funding_account_failures[account_name]
                             
                             error_msg = getattr(response, 'message', '') or ''
-                            error_msg_lower = error_msg.lower()
                             
                             # After 3 consecutive failures, reduce log level to WARNING
                             # Log summary every 10 failures instead of every failure
@@ -2703,8 +2750,7 @@ def main() -> None:
                                                 account_name, response.code, response.status, error_msg)
                                 
                                 # 根据错误类型给出更明确的提示（仅在详细日志时）
-                                # code=1000 且包含 "authenticate" 时，通常是 IP 白名单问题（登录返回 text/plain）
-                                if response.code == 1008 or 'whitelist' in error_msg_lower or 'ip' in error_msg_lower or (response.code == 1000 and 'authenticate' in error_msg_lower):
+                                if is_probable_ip_whitelist_error(response.code, error_msg):
                                     if log_level == logging.WARNING:
                                         logging.warning("[%s] ⚠️  IP 地址未在白名单中！", account_name)
                                         logging.warning("[%s] 请在 GRVT 网页端（Settings > API Keys）为 API key 添加当前 IP 地址到白名单。", account_name)
@@ -2712,15 +2758,15 @@ def main() -> None:
                                         logging.warning("[%s] 或者移除 IP 白名单限制（如果允许）。", account_name)
                                     else:
                                         logging.error("[%s] ⚠️ IP 白名单问题：请在 GRVT 网页端（Settings > API Keys）为 API key 添加当前 IP（https://api.ipify.org），或移除白名单限制（如允许）。", account_name)
-                                elif response.code == 1000:
+                                elif is_authentication_error(response.code, response.status, error_msg):
                                     if log_level == logging.WARNING:
-                                        logging.warning("[%s] Authentication failed. Please check:", account_name)
-                                        logging.warning("  1. IP address is whitelisted (most common issue)")
-                                        logging.warning("  2. API key is correct and matches the funding account ID")
-                                        logging.warning("  3. API key has 'View' or 'Internal Transfer' permission")
-                                        logging.warning("  4. Account type is correctly set to 'funding'")
+                                        logging.warning("[%s] Authentication failed after retry. Please check:", account_name)
+                                        logging.warning("  1. API key/account_id/private_key mapping is correct")
+                                        logging.warning("  2. API key has View/Internal Transfer permission")
+                                        logging.warning("  3. Account type is correctly set to 'funding'")
+                                        logging.warning("  4. If this persists, check IP whitelist as well")
                                     else:
-                                        logging.error("[%s] Authentication failed: check IP whitelist, API key matches funding account ID, API key has View/Internal Transfer permission, account type is funding.", account_name)
+                                        logging.error("[%s] Authentication failed after retry: check API key/account ID/private key mapping, permission, account type; if persistent, verify IP whitelist.", account_name)
                             
                             # 资金账户失败不阻塞自动平衡，但会影响每日汇总
                             funding_accounts_normal = False
