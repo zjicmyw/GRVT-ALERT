@@ -1371,12 +1371,14 @@ class DualMakerHedgeEngine:
         guard_price = side_guard.get("guard")
         if side is None:
             return
+        active_small_count = self._active_order_count(state, small_label)
         hedge_open = self._active_hedge_notional(state, small_label, side)
         gap = large_abs - (small_abs + hedge_open / Decimal("2"))
         if gap <= 0:
             return
         diff = large_abs - small_abs
-        if diff <= cfg.imbalance_limit_usdt and hedge_open > 0:
+        # Keep filling the small side up to per-account cap before imbalance_limit suppression.
+        if diff <= cfg.imbalance_limit_usdt and hedge_open > 0 and active_small_count >= per_account_cap:
             return
         order_notional = min(cfg.order_notional_usdt, gap * Decimal("2"))
         if order_notional <= 0:
@@ -1406,7 +1408,7 @@ class DualMakerHedgeEngine:
         order_notional = clipped
         if order_notional <= 0:
             return
-        if self._active_order_count(state, small_label) >= per_account_cap:
+        if active_small_count >= per_account_cap:
             return
         self._place_post_only_with_retry(
             state=state,
