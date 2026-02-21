@@ -1380,7 +1380,12 @@ class DualMakerHedgeEngine:
         # Keep filling the small side up to per-account cap before imbalance_limit suppression.
         if diff <= cfg.imbalance_limit_usdt and hedge_open > 0 and active_small_count >= per_account_cap:
             return
-        order_notional = min(cfg.order_notional_usdt, gap * Decimal("2"))
+        # When diff is above low-diff threshold and small side has not reached per-account cap,
+        # prioritize standard notional to ensure the second order can be established.
+        if diff >= self.single_order_diff_threshold_usdt and active_small_count < per_account_cap:
+            order_notional = cfg.order_notional_usdt
+        else:
+            order_notional = min(cfg.order_notional_usdt, gap * Decimal("2"))
         if order_notional <= 0:
             return
         small_pos = pos_a if small_label == "A" else pos_b
