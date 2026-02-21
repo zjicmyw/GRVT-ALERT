@@ -590,6 +590,58 @@ GRVT_LOG_LEVEL=DEBUG  # 详细日志（用于调试）
 2. 查看当前 IP：https://api.ipify.org
 3. 或者移除 IP 白名单限制（如果允许）
 
+## Dual Maker 对冲引擎（新增）
+
+### 启动入口
+
+```powershell
+python grvt_dual_maker_hedge.py
+```
+
+### 核心规则
+
+- 全部下单为 `limit + post_only + GOOD_TILL_TIME`，拒绝主动吃单
+- 告警通道仅使用 Telegram 网关（`CHAT_ID` + `API_KEY`）
+- 对冲价格保护：
+- A 买入成交价为 `P`，B 的对应对冲卖单价格必须 `>= P`
+- B 卖出成交价为 `P`，A 的对应对冲买单价格必须 `<= P`
+- 启动时会接管已有仓位与已有挂单
+- 非策略订单不会自动撤销，只做告警
+
+### 关键环境变量
+
+- `GRVT_HEDGE_LOOP_INTERVAL_SEC`：主循环间隔（秒）
+- `GRVT_HEDGE_ORDERBOOK_DEPTH`：盘口深度参数（建议 `10`）
+- `GRVT_HEDGE_SDK_LOG_LEVEL`：SDK 内部日志级别（建议 `ERROR`）
+- `GRVT_HEDGE_SINGLE_ORDER_DIFF_THRESHOLD_USDT`：当同标的持仓差小于该值时，每个账户最多 `1` 个策略挂单（A 最多 1，B 最多 1）
+- `GRVT_HEDGE_MAX_RUNTIME_SEC`：最大运行时长（秒，`0` 表示不自动停止）
+- `GRVT_HEDGE_CANCEL_ON_STOP`：停止时是否清理策略挂单（`1/0`）
+- `GRVT_HEDGE_STOP_KEEP_STRATEGY_ORDERS`：停止清理时每账户每标的保留策略单数量（默认 `0`）
+- `GRVT_HEDGE_POST_ONLY_MAX_RETRY`：post-only 单轮最大重试次数
+- `GRVT_HEDGE_POST_ONLY_COOLDOWN_SEC`：重试耗尽后冷却时长（秒）
+- `GRVT_HEDGE_PARTIAL_FILL_TIMEOUT_SEC`：部分成交超时时间（秒）
+- `GRVT_HEDGE_STUCK_HOURS`：未对冲超时告警阈值（小时）
+- `GRVT_HEDGE_MMR_ALERT_THRESHOLD`：风险告警阈值（`maintenance_margin / equity`）
+- `GRVT_HEDGE_SYMBOLS_FILE`：标的策略配置文件路径（例如 `config/hedge_symbols.json`）
+
+### 标的配置文件
+
+- 模板文件：`config/hedge_symbols.example.json`
+- 建议复制为：`config/hedge_symbols.json`
+- `instrument` 支持大小写自动规范化（例如 `LTC_USDT_PERP` 会自动转为 `LTC_USDT_Perp`）
+- 每个标的支持：
+- `position_mode = "increase"`：增加持仓，受 `max_total_position_usdt` 上限控制
+- `position_mode = "decrease"`：减少持仓，受 `min_total_position_usdt` 下限控制
+
+### 相关文档
+
+- 需求总览：`docs/DUAL_MAKER_HEDGE_REQUIREMENTS.md`
+- 产品需求：`docs/DUAL_MAKER_HEDGE_REQUIREMENTS_PRODUCT.md`
+- 工程需求：`docs/DUAL_MAKER_HEDGE_REQUIREMENTS_ENGINEERING.md`
+- 规格：`docs/DUAL_MAKER_HEDGE_SPEC.md`
+- 运维：`docs/DUAL_MAKER_HEDGE_RUNBOOK.md`
+- 审计：`docs/DUAL_MAKER_HEDGE_AUDIT.md`
+
 ## 相关链接
 
 - [GRVT API 文档](https://api-docs.grvt.io/api_setup/#python-sdk)
