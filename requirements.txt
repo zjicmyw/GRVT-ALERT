@@ -1,0 +1,4 @@
+grvt-pysdk
+python-dotenv
+requests
+eth-account
