@@ -2,9 +2,9 @@
   {
     "instrument": "LTC_USDT_Perp",
     "enabled": true,
-    "order_notional_usdt": 200,
-    "imbalance_limit_usdt": 300,
-    "max_total_position_usdt": 6000,
+    "order_notional_usdt": 500,
+    "imbalance_limit_usdt": 510,
+    "max_total_position_usdt": 10000,
     "min_total_position_usdt": 0,
     "a_side_when_equal": "buy",
     "position_mode": "increase"
@@ -12,9 +12,9 @@
   {
     "instrument": "DOT_USDT_Perp",
     "enabled": true,
-    "order_notional_usdt": 200,
-    "imbalance_limit_usdt": 300,
-    "max_total_position_usdt": 6000,
+    "order_notional_usdt": 500,
+    "imbalance_limit_usdt": 510,
+    "max_total_position_usdt": 10000,
     "min_total_position_usdt": 0,
     "a_side_when_equal": "sell",
     "position_mode": "increase"
